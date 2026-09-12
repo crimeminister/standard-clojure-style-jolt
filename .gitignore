@@ -1,0 +1,4 @@
+.jolt/
+*.build/
+standard-clj
+target/

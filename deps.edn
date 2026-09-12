@@ -1,0 +1,34 @@
+{:paths ["src"]
+
+ :aliases
+ {:test
+  {:extra-paths ["test"]
+   :main-opts ["-m" "standard-clojure-style.parser-test"]}
+
+  ;; Debug build: fast compilation, keeps Chez inspector info and stack traces
+  :build-debug
+  {:main-opts ["-m" "standard-clojure-style.main"]
+   :jolt/build {:opt false
+                :boot :fast}}
+
+  ;; Performance-optimized release build:
+  ;; - :opt true           (optimized mode, strips app inspector overhead)
+  ;; - :direct-link true   (closed-world direct linking)
+  ;; - :closed-world true  (whole-program tree-shaking across core and app)
+  ;; - :boot :fast         (LZ4-compressed vfasl image for instant startup)
+  :build-release
+  {:main-opts ["-m" "standard-clojure-style.main"]
+   :jolt/build {:opt true
+                :direct-link true
+                :closed-world true
+                :boot :fast}}}
+
+ :tasks
+ {build-debug
+  "mkdir -p target/debug && jolt build -m standard-clojure-style.main -A:build-debug --dev -o target/debug/standard-clj"
+
+  build-release
+  "mkdir -p target/release && jolt build -m standard-clojure-style.main -A:build-release --opt --closed-world --direct-link -o target/release/standard-clj"
+
+  test
+  "jolt -A:test -m standard-clojure-style.parser-test && jolt -A:test -m standard-clojure-style.parse-ns-test && jolt -A:test -m standard-clojure-style.format-test"}}
