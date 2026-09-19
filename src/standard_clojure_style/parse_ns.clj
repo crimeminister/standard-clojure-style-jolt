@@ -205,9 +205,12 @@
       (recurse-all-children c f))))
 
 (defn flatten-tree [tree]
-  (let [nodes (atom [])]
-    (recurse-all-children tree #(swap! nodes conj %))
-    @nodes))
+  (letfn [(traverse [t node]
+            (let [t (conj! t node)]
+              (if-let [children (:children node)]
+                (reduce traverse t children)
+                t)))]
+    (persistent! (traverse (transient []) tree))))
 
 (defn get-text-from-root-node [root-node]
   (let [sb (StringBuilder.)]
@@ -221,18 +224,21 @@
     (str sb)))
 
 (defn get-metadata-strings-from-meta-node [meta-node]
-  (let [metadata (atom [])
-        marker (atom nil)]
-    (doseq [child-node (:children meta-node)]
-      (cond
-        (is-meta-marker child-node)
-        (reset! marker (:text child-node))
+  (loop [children (:children meta-node)
+         marker nil
+         metadata (transient [])]
+    (if (seq children)
+      (let [child-node (first children)]
+        (cond
+          (is-meta-marker child-node)
+          (recur (rest children) (:text child-node) metadata)
 
-        (and @marker (= (:name child-node) ".meta"))
-        (do
-          (swap! metadata conj (str @marker (get-text-from-root-node child-node)))
-          (reset! marker nil))))
-    @metadata))
+          (and marker (= (:name child-node) ".meta"))
+          (recur (rest children) nil (conj! metadata (str marker (get-text-from-root-node child-node))))
+
+          :else
+          (recur (rest children) marker metadata)))
+      (persistent! metadata))))
 
 (defn get-body-node-from-meta-node [meta-node]
   (some #(when (= (:name %) ".body") %) (:children meta-node)))
@@ -348,23 +354,26 @@
                 (throw (Exception. ":gen-class :exposes protected field names must be symbols.")))
               (when-not (is-map-literal-node accessors-node)
                 (throw (Exception. ":gen-class :exposes field values must be maps containing :get and/or :set.")))
-              (let [accessor-pairs (get-gen-class-map-pairs accessors-node ":gen-class :exposes accessor maps must contain keyword and method-name pairs.")
-                    seen (atom #{})
-                    expose (atom {"fieldName" field-name})]
-                (doseq [[k-node v-node] accessor-pairs]
-                  (let [k (when (is-token-node k-node) (:text k-node))
-                        v (get-gen-class-symbol-text v-node)]
-                    (when (and (not= k ":get") (not= k ":set"))
-                      (throw (Exception. ":gen-class :exposes accessor keys must be :get or :set.")))
-                    (when (contains? @seen k)
-                      (throw (Exception. ":gen-class :exposes accessor maps cannot repeat :get or :set.")))
-                    (when-not v
-                      (throw (Exception. ":gen-class :exposes accessor method names must be symbols.")))
-                    (swap! seen conj k)
-                    (if (= k ":get")
-                      (swap! expose assoc "getter" v)
-                      (swap! expose assoc "setter" v))))
-                @expose)))
+              (let [accessor-pairs (get-gen-class-map-pairs accessors-node ":gen-class :exposes accessor maps must contain keyword and method-name pairs.")]
+                (loop [pairs accessor-pairs
+                       seen (transient #{})
+                       expose (transient {"fieldName" field-name})]
+                  (if (seq pairs)
+                    (let [[k-node v-node] (first pairs)
+                          k (when (is-token-node k-node) (:text k-node))
+                          v (get-gen-class-symbol-text v-node)]
+                      (when (and (not= k ":get") (not= k ":set"))
+                        (throw (Exception. ":gen-class :exposes accessor keys must be :get or :set.")))
+                      (when (contains? seen k)
+                        (throw (Exception. ":gen-class :exposes accessor maps cannot repeat :get or :set.")))
+                      (when-not v
+                        (throw (Exception. ":gen-class :exposes accessor method names must be symbols.")))
+                      (recur (rest pairs)
+                             (conj! seen k)
+                             (if (= k ":get")
+                               (assoc! expose "getter" v)
+                               (assoc! expose "setter" v))))
+                    (persistent! expose))))))
           pairs)))
 
 (defn parse-gen-class-exposes-methods [map-node]
@@ -618,18 +627,30 @@
 
     (when-let [meta-list (get @res "nsMetadata")]
       (when (> (count meta-list) 1)
-        (let [meta-map (atom {})
-              meta-keys (atom [])]
-          (doseq [itm meta-list]
-            (swap! meta-map assoc (get itm "key") (get itm "value"))
-            (swap! meta-keys conj (get itm "key")))
-          (let [new-meta (atom [])
-                seen (atom #{})]
-            (doseq [k (reverse @meta-keys)]
-              (when-not (@seen k)
-                (swap! seen conj k)
-                (swap! new-meta conj {"key" k "value" (get @meta-map k)})))
-            (swap! res assoc "nsMetadata" (vec (reverse @new-meta)))))))
+        (let [meta-map (loop [itms meta-list
+                              m (transient {})]
+                         (if (seq itms)
+                           (let [itm (first itms)]
+                             (recur (rest itms) (assoc! m (get itm "key") (get itm "value"))))
+                           (persistent! m)))
+              meta-keys (loop [itms meta-list
+                               ks (transient [])]
+                          (if (seq itms)
+                            (let [itm (first itms)]
+                              (recur (rest itms) (conj! ks (get itm "key"))))
+                            (persistent! ks)))
+              new-meta (loop [ks (reverse meta-keys)
+                              seen (transient #{})
+                              res-meta (transient [])]
+                         (if (seq ks)
+                           (let [k (first ks)]
+                             (if (contains? seen k)
+                               (recur (rest ks) seen res-meta)
+                               (recur (rest ks)
+                                      (conj! seen k)
+                                      (conj! res-meta {"key" k "value" (get meta-map k)}))))
+                           (persistent! res-meta)))]
+          (swap! res assoc "nsMetadata" (vec (reverse new-meta))))))
 
     @res))
 

@@ -71,31 +71,35 @@
 
 (defn get-platforms-from-array [arr]
   (let [has-default (atom false)
-        platforms (atom #{})]
-    (doseq [itm arr]
-      (when-let [p (get itm "platform")]
-        (if (= p ":default")
-          (reset! has-default true)
-          (swap! platforms conj p))))
-    (let [sorted-platforms (sort @platforms)]
+        platforms (loop [itms arr
+                         p-set (transient #{})]
+                    (if (seq itms)
+                      (let [itm (first itms)
+                            p (get itm "platform")]
+                        (if p
+                          (if (= p ":default")
+                            (do (reset! has-default true)
+                                (recur (rest itms) p-set))
+                            (recur (rest itms) (conj! p-set p)))
+                          (recur (rest itms) p-set)))
+                      (persistent! p-set)))]
+    (let [sorted-platforms (sort platforms)]
       (if @has-default
         (vec (concat sorted-platforms [":default"]))
         (vec sorted-platforms)))))
 
 (defn only-one-require-per-platform [reqs]
-  (let [counts (atom {})]
-    (loop [idx 0]
-      (if (>= idx (count reqs))
-        true
-        (let [req (nth reqs idx)
-              p (get req "platform")]
-          (if (and (string? p) (not= p ""))
-            (if (get @counts p)
-              false
-              (do
-                (swap! counts assoc p 1)
-                (recur (inc idx))))
-            (recur (inc idx))))))))
+  (loop [idx 0
+         counts (transient #{})]
+    (if (>= idx (count reqs))
+      true
+      (let [req (nth reqs idx)
+            p (get req "platform")]
+        (if (and (string? p) (not= p ""))
+          (if (contains? counts p)
+            false
+            (recur (inc idx) (conj! counts p)))
+          (recur (inc idx) counts))))))
 
 (defn filter-on-platform [arr platform]
   (vec
@@ -108,12 +112,12 @@
 (defn format-renames-list [itms]
   (let [num-itms (count itms)]
     (loop [idx 0
-           parts []]
+           parts (transient [])]
       (if (>= idx num-itms)
-        (str/join ", " parts)
+        (str/join ", " (persistent! parts))
         (let [itm (nth itms idx)
               pair-str (str (get itm "fromSymbol") " " (get itm "toSymbol"))]
-          (recur (inc idx) (conj parts pair-str)))))))
+          (recur (inc idx) (conj! parts pair-str)))))))
 
 (defn format-require-line [req initial-indentation metadata-inline]
   (let [out (atom "")
@@ -170,12 +174,13 @@
     @out))
 
 (defn get-refer-clojure-keys [refer-clojure]
-  (let [keys-vec (atom [])]
-    (when refer-clojure
-      (when (get refer-clojure "exclude") (swap! keys-vec conj ":exclude"))
-      (when (get refer-clojure "only") (swap! keys-vec conj ":only"))
-      (when (get refer-clojure "rename") (swap! keys-vec conj ":rename")))
-    @keys-vec))
+  (if-not refer-clojure
+    []
+    (let [keys-t (transient [])
+          keys-t (if (get refer-clojure "exclude") (conj! keys-t ":exclude") keys-t)
+          keys-t (if (get refer-clojure "only") (conj! keys-t ":only") keys-t)
+          keys-t (if (get refer-clojure "rename") (conj! keys-t ":rename") keys-t)]
+      (persistent! keys-t))))
 
 (defn format-keyword-followed-by-list-of-symbols [kwd symbols]
   (str kwd " [" (str/join " " symbols) "]"))
