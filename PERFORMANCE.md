@@ -7,7 +7,7 @@ This document provides a comparative performance benchmark between **`standard-c
 ## 1. Test Environment & Methodology
 
 - **OS / Architecture:** Linux x86_64
-- **Jolt Dialect Version:** 0.8.8 (Chez Scheme backend; updated from 0.8.6)
+- **Jolt Dialect Version:** 0.8.9 (Chez Scheme backend; updated from 0.8.8 and 0.8.6)
 - **Node / V8 Environment:** Node.js invoked via `nix-shell -p pnpm --run "pnpx @chrisoakman/standard-clojure-style check ..."`
 - **Target Directories:** `src/`, `test/`, `test_cases/` (12 files total, including `.clj` source files and `.edn` test fixture suites)
 
@@ -131,7 +131,52 @@ Following the implementation of the performance enhancement plan:
 3. **Continuation-Based Fast Escapes (`jolt.continuations`):** Employed `c/letcc [escape]` for zero-overhead escapes out of `Choice` parser loops.
 4. **Fiber-Backed Multi-Core CLI Concurrency (`jolt.fibers`):** Formatted files concurrently across all 20 CPU carrier threads while preserving deterministic sorted console output.
 
-### Updated Benchmark Comparison (Jolt 0.8.8)
+### Updated Benchmark Comparison (Jolt 0.8.9)
+
+```text
+$ ./standard-clj check src/ test/ test_cases/
+standard-clj check [0.29.0]
+
+✓ src/standard_clojure_style/cli.clj [109.0ms]
+✓ src/standard_clojure_style/core.clj [6.0ms]
+✓ src/standard_clojure_style/format.clj [183.0ms]
+✓ src/standard_clojure_style/main.clj [2.0ms]
+✓ src/standard_clojure_style/parse_ns.clj [218.0ms]
+✓ src/standard_clojure_style/parser.clj [58.0ms]
+✓ test/standard_clojure_style/format_test.clj [15.0ms]
+✓ test/standard_clojure_style/parse_ns_test.clj [17.0ms]
+✓ test/standard_clojure_style/parser_test.clj [17.0ms]
+✓ test_cases/format_tests.edn [125.0ms]
+✓ test_cases/parse_ns_tests.edn [223.0ms]
+✓ test_cases/parser_tests.edn [77.0ms]
+
+All 12 files formatted with Standard Clojure Style 👍 [224.0ms]
+```
+
+### Comparative Summary
+
+| Metric | Initial `standard-clj` (v0.8.6 Baseline) | Post-Optimization `standard-clj` (v0.8.6) | Historical `standard-clj` (v0.8.8) | Fresh Evaluation `standard-clj` (v0.8.9) | `standard-clojure-style-js` | Overall Improvement (vs Baseline) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `parse_ns.clj` parse time | 591 ms | 101 ms | 95 ms | **41 ms** | ~3 ms | **14.4x faster parse** |
+| `parse_ns.clj` format time | 11,849 ms | 405 ms | 388 ms | **218 ms** | 15.9 ms | **54.4x faster format** |
+| **Total CLI Runtime (12 files)** | **22,113 ms (~22.1s)** | **407 ms (~0.41s)** | **389 ms (~0.39s)** | **224 ms (~0.22s)** | **69.9 ms (~0.07s)** | **98.7x overall speedup** |
+
+### Evaluation of `jolt.parser` Alternative
+
+Testing Jolt's built-in `jolt.parser` (`jolt.parser.combinators`, `jolt.parser.basic`) revealed that it is a monadic parser framework (Parsec-style) that tracks input coordinates by constructing `#jolt.parser.position.Location` records for every character token. 
+- Running a simple `(pc/many pb/any)` on `parse_ns.clj` (78,100 characters) in Jolt 0.8.9 required **615 ms** (down from 646 ms in 0.8.8 and 653 ms in 0.8.6) solely to generate character location tokens.
+- In contrast, our index-based CST parser parses the complete CST grammar of `parse_ns.clj` in **41 ms** (down from 95 ms in 0.8.8 and 101 ms in 0.8.6).
+- **Conclusion:** Retaining the custom, zero-allocation index-based CST parser provides superior performance and preserves 100% CST schema fidelity with upstream tests.
+
+---
+
+## Appendix: Historical Results
+
+For historical tracking and comparison, post-optimization benchmark results gathered under previous Jolt versions are preserved below.
+
+### Historical Results (Jolt 0.8.8)
+
+#### CLI Output (Jolt 0.8.8)
 
 ```text
 $ ./standard-clj check src/ test/ test_cases/
@@ -153,28 +198,16 @@ standard-clj check [0.29.0]
 All 12 files formatted with Standard Clojure Style 👍 [389.0ms]
 ```
 
-### Comparative Summary
+#### Metrics Recorded Under Jolt 0.8.8
 
-| Metric | Initial `standard-clj` (v0.8.6 Baseline) | Post-Optimization `standard-clj` (v0.8.6) | Fresh Evaluation `standard-clj` (v0.8.8) | `standard-clojure-style-js` | Overall Improvement (vs Baseline) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| `parse_ns.clj` parse time | 591 ms | 101 ms | **95 ms** | ~3 ms | **6.2x faster parse** |
-| `parse_ns.clj` format time | 11,849 ms | 405 ms | **388 ms** | 15.9 ms | **30.5x faster format** |
-| **Total CLI Runtime (12 files)** | **22,113 ms (~22.1s)** | **407 ms (~0.41s)** | **389 ms (~0.39s)** | **69.9 ms (~0.07s)** | **56.8x overall speedup** |
+- **`parse_ns.clj` Parse Time:** 95 ms
+- **`parse_ns.clj` Format Time:** 388.0 ms
+- **Total CLI Runtime (12 files):** 389.0 ms
+- **`jolt.parser` Combinator `(pc/many pb/any)`:** 646 ms
 
-### Evaluation of `jolt.parser` Alternative
+### Historical Results (Jolt 0.8.6)
 
-Testing Jolt's built-in `jolt.parser` (`jolt.parser.combinators`, `jolt.parser.basic`) revealed that it is a monadic parser framework (Parsec-style) that tracks input coordinates by constructing `#jolt.parser.position.Location` records for every character token. 
-- Running a simple `(pc/many pb/any)` on `parse_ns.clj` (78,100 characters) in Jolt 0.8.8 required **646 ms** (down from 653 ms in 0.8.6) solely to generate character location tokens.
-- In contrast, our index-based CST parser parses the complete CST grammar of `parse_ns.clj` in **95 ms** (down from 101 ms in 0.8.6).
-- **Conclusion:** Retaining the custom, zero-allocation index-based CST parser provides superior performance and preserves 100% CST schema fidelity with upstream tests.
-
----
-
-## Appendix: Historical Results (Jolt 0.8.6)
-
-For historical tracking and comparison, the post-optimization benchmark results gathered under Jolt v0.8.6 are preserved below.
-
-### Post-Optimization CLI Output (Jolt 0.8.6)
+#### Post-Optimization CLI Output (Jolt 0.8.6)
 
 ```text
 $ ./standard-clj check src/ test/ test_cases/
@@ -196,7 +229,7 @@ standard-clj check [0.29.0]
 All 12 files formatted with Standard Clojure Style 👍 [407.0ms]
 ```
 
-### Metrics Recorded Under Jolt 0.8.6
+#### Metrics Recorded Under Jolt 0.8.6
 
 - **`parse_ns.clj` Parse Time:** 101 ms
 - **`parse_ns.clj` Format Time:** 405.0 ms
