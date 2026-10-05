@@ -681,98 +681,126 @@
 ;; -----------------------------------------------------------------------------
 ;; parseNs
 
+(defn- closes-more-than-it-opens?
+  "True when some prefix of nodes-arr closes more parens than it opens: the
+  parse-ns walk pops an empty paren stack there, and throws."
+  [nodes-arr]
+  (loop [i 0
+         depth 0]
+    (cond
+      (neg? depth) true
+      (>= i (count nodes-arr)) false
+      :else (let [node (nth nodes-arr i)]
+              (recur (inc i)
+                     (cond
+                       (is-paren-opener node) (inc depth)
+                       (is-paren-closer node) (dec depth)
+                       :else depth))))))
+
+(declare parse-ns-walk)
+
 (defn parse-ns [nodes-arr]
+  ;; Everything the walk records hangs off the ns form, which starts at an ns
+  ;; token. With none in the file the walk can only reach the end, or throw on
+  ;; an unbalanced closer, so skip it for files without one (data files, mostly)
+  (if (and (seq nodes-arr)
+           (not-any? is-ns-node nodes-arr)
+           (not (closes-more-than-it-opens? nodes-arr)))
+    (sort-ns-result {"nsSymbol" nil} {})
+    (parse-ns-walk nodes-arr)))
+
+(defn- parse-ns-walk [nodes-arr]
   (let [num-nodes (count nodes-arr)
-        result (atom {"nsSymbol" nil})
-        prefix-list-comments (atom {})
+        result (volatile! {"nsSymbol" nil})
+        prefix-list-comments (volatile! {})
 
         ;; State variables
-        continue-parsing-ns-form (atom true)
-        ns-form-ends-line-idx (atom -1)
-        paren-nesting-depth (atom 0)
-        line-no (atom 0)
-        paren-stack (atom [])
-        inside-ns-form (atom false)
-        inside-refer-clojure-form (atom false)
-        refer-clojure-paren-nesting-depth (atom -1)
-        inside-require-form (atom false)
-        require-form-paren-nesting-depth (atom -1)
-        require-form-line-no (atom -1)
-        inside-import-form (atom false)
-        import-form-line-no (atom -1)
-        next-text-node-is-ns-symbol (atom false)
-        inside-import-package-list (atom false)
-        collect-refer-clojure-exclude-symbols (atom false)
-        collect-refer-clojure-only-symbols (atom false)
-        collect-refer-clojure-rename-symbols (atom false)
-        collect-require-exclude-symbols (atom false)
-        require-exclude-symbol-paren-depth (atom -1)
-        renames-tmp (atom [])
-        import-package-list-first-token (atom nil)
-        ns-node-idx (atom -1)
-        ns-symbol-idx (atom -1)
-        beyond-ns-metadata (atom false)
-        inside-ns-metadata-hash-map (atom false)
-        inside-ns-metadata-shorthand (atom false)
-        next-token-node-is-metadata-true-key (atom false)
-        next-text-node-is-metadata-key (atom false)
-        metadata-value-node-id (atom -1)
-        tmp-metadata-key (atom "")
-        refer-clojure-node-idx (atom -1)
-        require-node-idx (atom -1)
-        refer-idx (atom -1)
-        refer-paren-nesting-depth (atom -1)
-        import-node-idx (atom -1)
-        import-node-paren-nesting-depth (atom -1)
-        active-require-idx (atom -1)
-        require-symbol-idx (atom -1)
-        next-token-is-as-symbol (atom false)
-        single-line-comments (atom [])
-        active-import-package-name (atom nil)
-        prev-node-is-newline (atom false)
-        line-of-last-comment-recording (atom -1)
-        inside-prefix-list (atom false)
-        prefix-list-paren-nesting-depth (atom -1)
-        prefix-list-prefix (atom nil)
-        prefix-list-line-no (atom -1)
-        current-prefix-list-id (atom nil)
-        inside-reader-conditional (atom false)
-        current-reader-conditional-platform (atom nil)
-        reader-conditional-paren-nesting-depth (atom -1)
-        inside-require-list (atom false)
-        require-list-paren-nesting-depth (atom -1)
-        refer-macros-idx (atom -1)
-        refer-macros-paren-nesting-depth (atom -1)
-        inside-include-macros (atom false)
-        active-require-macros-idx (atom -1)
-        inside-require-macros-form (atom false)
-        require-macros-node-idx (atom -1)
-        require-macros-line-no (atom -1)
-        require-macros-paren-nesting-depth (atom -1)
-        require-macros-refer-node-idx (atom -1)
-        require-macros-as-node-idx (atom -1)
-        require-macros-rename-idx (atom -1)
-        gen-class-node-idx (atom -1)
-        inside-gen-class (atom false)
-        gen-class-line-no (atom -1)
-        gen-class-toggle (atom 0)
-        gen-class-key-str (atom nil)
-        gen-class-value-line-no (atom -1)
-        inside-reader-comment (atom false)
-        id-of-last-node-inside-reader-comment (atom -1)
-        rename-idx (atom -1)
-        rename-paren-nesting-depth (atom -1)
-        skip-nodes-until-we-reach-this-id (atom -1)
-        section-to-attach-eol-comments-to (atom nil)
-        next-token-is-require-default-symbol (atom false)
-        num-symbols-inside-list (atom 0)
-        inside-gen-class-implements (atom false)
-        gen-class-implements-paren-depth (atom -1)
-        gen-class-value-last-node-id (atom -1)
-        pending-require-metadata (atom [])
-        pending-reader-comment-line-no (atom -1)
+        continue-parsing-ns-form (volatile! true)
+        ns-form-ends-line-idx (volatile! -1)
+        paren-nesting-depth (volatile! 0)
+        line-no (volatile! 0)
+        paren-stack (volatile! [])
+        inside-ns-form (volatile! false)
+        inside-refer-clojure-form (volatile! false)
+        refer-clojure-paren-nesting-depth (volatile! -1)
+        inside-require-form (volatile! false)
+        require-form-paren-nesting-depth (volatile! -1)
+        require-form-line-no (volatile! -1)
+        inside-import-form (volatile! false)
+        import-form-line-no (volatile! -1)
+        next-text-node-is-ns-symbol (volatile! false)
+        inside-import-package-list (volatile! false)
+        collect-refer-clojure-exclude-symbols (volatile! false)
+        collect-refer-clojure-only-symbols (volatile! false)
+        collect-refer-clojure-rename-symbols (volatile! false)
+        collect-require-exclude-symbols (volatile! false)
+        require-exclude-symbol-paren-depth (volatile! -1)
+        renames-tmp (volatile! [])
+        import-package-list-first-token (volatile! nil)
+        ns-node-idx (volatile! -1)
+        ns-symbol-idx (volatile! -1)
+        beyond-ns-metadata (volatile! false)
+        inside-ns-metadata-hash-map (volatile! false)
+        inside-ns-metadata-shorthand (volatile! false)
+        next-token-node-is-metadata-true-key (volatile! false)
+        next-text-node-is-metadata-key (volatile! false)
+        metadata-value-node-id (volatile! -1)
+        tmp-metadata-key (volatile! "")
+        refer-clojure-node-idx (volatile! -1)
+        require-node-idx (volatile! -1)
+        refer-idx (volatile! -1)
+        refer-paren-nesting-depth (volatile! -1)
+        import-node-idx (volatile! -1)
+        import-node-paren-nesting-depth (volatile! -1)
+        active-require-idx (volatile! -1)
+        require-symbol-idx (volatile! -1)
+        next-token-is-as-symbol (volatile! false)
+        single-line-comments (volatile! [])
+        active-import-package-name (volatile! nil)
+        prev-node-is-newline (volatile! false)
+        line-of-last-comment-recording (volatile! -1)
+        inside-prefix-list (volatile! false)
+        prefix-list-paren-nesting-depth (volatile! -1)
+        prefix-list-prefix (volatile! nil)
+        prefix-list-line-no (volatile! -1)
+        current-prefix-list-id (volatile! nil)
+        inside-reader-conditional (volatile! false)
+        current-reader-conditional-platform (volatile! nil)
+        reader-conditional-paren-nesting-depth (volatile! -1)
+        inside-require-list (volatile! false)
+        require-list-paren-nesting-depth (volatile! -1)
+        refer-macros-idx (volatile! -1)
+        refer-macros-paren-nesting-depth (volatile! -1)
+        inside-include-macros (volatile! false)
+        active-require-macros-idx (volatile! -1)
+        inside-require-macros-form (volatile! false)
+        require-macros-node-idx (volatile! -1)
+        require-macros-line-no (volatile! -1)
+        require-macros-paren-nesting-depth (volatile! -1)
+        require-macros-refer-node-idx (volatile! -1)
+        require-macros-as-node-idx (volatile! -1)
+        require-macros-rename-idx (volatile! -1)
+        gen-class-node-idx (volatile! -1)
+        inside-gen-class (volatile! false)
+        gen-class-line-no (volatile! -1)
+        gen-class-toggle (volatile! 0)
+        gen-class-key-str (volatile! nil)
+        gen-class-value-line-no (volatile! -1)
+        inside-reader-comment (volatile! false)
+        id-of-last-node-inside-reader-comment (volatile! -1)
+        rename-idx (volatile! -1)
+        rename-paren-nesting-depth (volatile! -1)
+        skip-nodes-until-we-reach-this-id (volatile! -1)
+        section-to-attach-eol-comments-to (volatile! nil)
+        next-token-is-require-default-symbol (volatile! false)
+        num-symbols-inside-list (volatile! 0)
+        inside-gen-class-implements (volatile! false)
+        gen-class-implements-paren-depth (volatile! -1)
+        gen-class-value-last-node-id (volatile! -1)
+        pending-require-metadata (volatile! [])
+        pending-reader-comment-line-no (volatile! -1)
 
-        idx (atom 0)]
+        idx (volatile! 0)]
 
     (while @continue-parsing-ns-form
       (let [node (nth nodes-arr @idx)
@@ -782,164 +810,164 @@
             node-has-non-blank-text (is-node-with-non-blank-text node)]
 
         (when (and (>= @paren-nesting-depth 1) is-token-node2 node-has-non-blank-text)
-          (swap! num-symbols-inside-list inc))
+          (vswap! num-symbols-inside-list inc))
 
         (cond
           (and (= @paren-nesting-depth 1) (is-ns-node node) (= @num-symbols-inside-list 1))
           (do
-            (reset! inside-ns-form true)
-            (reset! next-text-node-is-ns-symbol true)
-            (reset! ns-node-idx @idx))
+            (vreset! inside-ns-form true)
+            (vreset! next-text-node-is-ns-symbol true)
+            (vreset! ns-node-idx @idx))
 
           (and @inside-ns-form (is-refer-clojure-node node))
           (do
-            (reset! inside-refer-clojure-form true)
-            (reset! refer-clojure-paren-nesting-depth @paren-nesting-depth)
-            (reset! section-to-attach-eol-comments-to "refer-clojure")
-            (reset! refer-clojure-node-idx @idx)
-            (reset! beyond-ns-metadata true))
+            (vreset! inside-refer-clojure-form true)
+            (vreset! refer-clojure-paren-nesting-depth @paren-nesting-depth)
+            (vreset! section-to-attach-eol-comments-to "refer-clojure")
+            (vreset! refer-clojure-node-idx @idx)
+            (vreset! beyond-ns-metadata true))
 
           (and @inside-ns-form (is-require-node node))
           (do
-            (reset! inside-require-form true)
-            (reset! require-form-paren-nesting-depth @paren-nesting-depth)
-            (reset! require-form-line-no @line-no)
-            (reset! require-node-idx @idx)
-            (reset! beyond-ns-metadata true)
-            (reset! section-to-attach-eol-comments-to "require"))
+            (vreset! inside-require-form true)
+            (vreset! require-form-paren-nesting-depth @paren-nesting-depth)
+            (vreset! require-form-line-no @line-no)
+            (vreset! require-node-idx @idx)
+            (vreset! beyond-ns-metadata true)
+            (vreset! section-to-attach-eol-comments-to "require"))
 
           (and @inside-ns-form (is-import-node node))
           (do
-            (reset! inside-import-form true)
-            (reset! import-form-line-no @line-no)
-            (reset! import-node-idx @idx)
-            (reset! import-node-paren-nesting-depth @paren-nesting-depth)
-            (reset! beyond-ns-metadata true)
-            (reset! section-to-attach-eol-comments-to "import"))
+            (vreset! inside-import-form true)
+            (vreset! import-form-line-no @line-no)
+            (vreset! import-node-idx @idx)
+            (vreset! import-node-paren-nesting-depth @paren-nesting-depth)
+            (vreset! beyond-ns-metadata true)
+            (vreset! section-to-attach-eol-comments-to "import"))
 
           (and @inside-ns-form (is-require-macros-keyword node))
           (do
-            (reset! inside-require-macros-form true)
-            (reset! require-macros-node-idx @idx)
-            (reset! require-macros-line-no @line-no)
-            (reset! require-macros-paren-nesting-depth @paren-nesting-depth)
-            (reset! beyond-ns-metadata true)
-            (reset! section-to-attach-eol-comments-to "require-macros"))
+            (vreset! inside-require-macros-form true)
+            (vreset! require-macros-node-idx @idx)
+            (vreset! require-macros-line-no @line-no)
+            (vreset! require-macros-paren-nesting-depth @paren-nesting-depth)
+            (vreset! beyond-ns-metadata true)
+            (vreset! section-to-attach-eol-comments-to "require-macros"))
 
           (and @inside-ns-form (is-gen-class-node node))
           (do
-            (reset! inside-gen-class true)
-            (reset! gen-class-node-idx @idx)
-            (reset! beyond-ns-metadata true)
-            (reset! section-to-attach-eol-comments-to "gen-class")))
+            (vreset! inside-gen-class true)
+            (vreset! gen-class-node-idx @idx)
+            (vreset! beyond-ns-metadata true)
+            (vreset! section-to-attach-eol-comments-to "gen-class")))
 
         (if (is-paren-opener node)
           (do
-            (swap! paren-nesting-depth inc)
-            (swap! paren-stack conj node)
-            (reset! num-symbols-inside-list 0)
+            (vswap! paren-nesting-depth inc)
+            (vswap! paren-stack conj node)
+            (vreset! num-symbols-inside-list 0)
             (cond
               (and @inside-ns-form (is-reader-conditional-opener node))
               (do
-                (reset! inside-reader-conditional true)
-                (reset! current-reader-conditional-platform nil)
-                (reset! reader-conditional-paren-nesting-depth @paren-nesting-depth))
+                (vreset! inside-reader-conditional true)
+                (vreset! current-reader-conditional-platform nil)
+                (vreset! reader-conditional-paren-nesting-depth @paren-nesting-depth))
 
               (and @inside-require-form (= @require-list-paren-nesting-depth -1))
               (do
-                (reset! inside-require-list true)
-                (reset! require-list-paren-nesting-depth @paren-nesting-depth))
+                (vreset! inside-require-list true)
+                (vreset! require-list-paren-nesting-depth @paren-nesting-depth))
 
               (and @inside-import-form (> @paren-nesting-depth @import-node-paren-nesting-depth))
-              (reset! inside-import-package-list true)
+              (vreset! inside-import-package-list true)
 
               (and @inside-gen-class (= @gen-class-toggle 1) (= @gen-class-key-str "implements"))
               (do
-                (reset! inside-gen-class-implements true)
-                (reset! gen-class-implements-paren-depth @paren-nesting-depth)
+                (vreset! inside-gen-class-implements true)
+                (vreset! gen-class-implements-paren-depth @paren-nesting-depth)
                 (when-not (vector? (get-in @result ["genClass" "implements"]))
                   (let [existing (get-in @result ["genClass" "implements"])
                         c-above (when (map? existing) (get existing "commentsAbove"))]
-                    (swap! result assoc-in ["genClass" "implements"] (with-meta [] (when c-above {"commentsAbove" c-above}))))))))
+                    (vswap! result assoc-in ["genClass" "implements"] (with-meta [] (when c-above {"commentsAbove" c-above}))))))))
 
           (when (is-paren-closer node)
-            (swap! paren-nesting-depth dec)
-            (swap! paren-stack pop)
+            (vswap! paren-nesting-depth dec)
+            (vswap! paren-stack pop)
 
             (when (and @inside-ns-form (= @paren-nesting-depth 0))
-              (reset! inside-ns-form false)
-              (reset! ns-form-ends-line-idx @line-no))
+              (vreset! inside-ns-form false)
+              (vreset! ns-form-ends-line-idx @line-no))
 
             (when @inside-import-package-list
-              (reset! inside-import-package-list false)
-              (reset! import-package-list-first-token nil))
+              (vreset! inside-import-package-list false)
+              (vreset! import-package-list-first-token nil))
 
             (when (and @inside-require-form (< @paren-nesting-depth @require-form-paren-nesting-depth))
-              (reset! inside-require-form false)
-              (reset! require-form-paren-nesting-depth -1))
+              (vreset! inside-require-form false)
+              (vreset! require-form-paren-nesting-depth -1))
 
             (when (and @inside-refer-clojure-form (< @paren-nesting-depth @refer-clojure-paren-nesting-depth))
-              (reset! inside-refer-clojure-form false)
-              (reset! refer-clojure-node-idx -1))
+              (vreset! inside-refer-clojure-form false)
+              (vreset! refer-clojure-node-idx -1))
 
             (when (and @inside-refer-clojure-form (<= @paren-nesting-depth @refer-clojure-paren-nesting-depth))
-              (reset! collect-refer-clojure-exclude-symbols false)
-              (reset! collect-refer-clojure-only-symbols false)
-              (reset! collect-refer-clojure-rename-symbols false))
+              (vreset! collect-refer-clojure-exclude-symbols false)
+              (vreset! collect-refer-clojure-only-symbols false)
+              (vreset! collect-refer-clojure-rename-symbols false))
 
             (when (and (> @refer-idx 0) (<= @paren-nesting-depth @refer-paren-nesting-depth))
-              (reset! refer-idx -1)
-              (reset! refer-paren-nesting-depth -1))
+              (vreset! refer-idx -1)
+              (vreset! refer-paren-nesting-depth -1))
 
             (when (and (> @rename-idx 0) (<= @paren-nesting-depth @rename-paren-nesting-depth))
-              (reset! rename-idx -1)
-              (reset! rename-paren-nesting-depth -1))
+              (vreset! rename-idx -1)
+              (vreset! rename-paren-nesting-depth -1))
 
             (when (and @inside-require-list (< @paren-nesting-depth @require-list-paren-nesting-depth))
-              (reset! inside-require-list false)
-              (reset! require-list-paren-nesting-depth -1)
-              (reset! next-token-is-require-default-symbol false))
+              (vreset! inside-require-list false)
+              (vreset! require-list-paren-nesting-depth -1)
+              (vreset! next-token-is-require-default-symbol false))
 
             (when (and @inside-require-form (> @require-symbol-idx 0))
-              (reset! require-symbol-idx -1))
+              (vreset! require-symbol-idx -1))
 
             (when (and @inside-require-form @inside-prefix-list (not= @prefix-list-paren-nesting-depth -1) (= @paren-nesting-depth (dec @prefix-list-paren-nesting-depth)))
-              (reset! inside-prefix-list false)
-              (reset! prefix-list-prefix nil)
-              (reset! prefix-list-paren-nesting-depth -1))
+              (vreset! inside-prefix-list false)
+              (vreset! prefix-list-prefix nil)
+              (vreset! prefix-list-paren-nesting-depth -1))
 
             (when (and @inside-reader-conditional (= @paren-nesting-depth (dec @reader-conditional-paren-nesting-depth)))
-              (reset! inside-reader-conditional false)
-              (reset! current-reader-conditional-platform nil)
-              (reset! reader-conditional-paren-nesting-depth -1))
+              (vreset! inside-reader-conditional false)
+              (vreset! current-reader-conditional-platform nil)
+              (vreset! reader-conditional-paren-nesting-depth -1))
 
             (when (and (> @idx @refer-macros-idx) (<= @paren-nesting-depth @refer-macros-paren-nesting-depth))
-              (reset! refer-macros-idx -1)
-              (reset! refer-macros-paren-nesting-depth -1))
+              (vreset! refer-macros-idx -1)
+              (vreset! refer-macros-paren-nesting-depth -1))
 
             (when (and @inside-import-form (< @paren-nesting-depth @import-node-paren-nesting-depth))
-              (reset! inside-import-form false)
-              (reset! import-node-idx -1)
-              (reset! import-node-paren-nesting-depth -1))
+              (vreset! inside-import-form false)
+              (vreset! import-node-idx -1)
+              (vreset! import-node-paren-nesting-depth -1))
 
             (when (and @inside-require-macros-form (< @paren-nesting-depth @require-macros-paren-nesting-depth))
-              (reset! inside-require-macros-form false)
-              (reset! require-macros-paren-nesting-depth -1)
-              (reset! require-macros-node-idx -1)
-              (reset! require-macros-as-node-idx -1))
+              (vreset! inside-require-macros-form false)
+              (vreset! require-macros-paren-nesting-depth -1)
+              (vreset! require-macros-node-idx -1)
+              (vreset! require-macros-as-node-idx -1))
 
             (when (and @collect-require-exclude-symbols (< @paren-nesting-depth @require-exclude-symbol-paren-depth))
-              (reset! collect-require-exclude-symbols false)
-              (reset! require-exclude-symbol-paren-depth -1))
+              (vreset! collect-require-exclude-symbols false)
+              (vreset! require-exclude-symbol-paren-depth -1))
 
             (when (and @inside-gen-class-implements (< @paren-nesting-depth @gen-class-implements-paren-depth))
-              (reset! inside-gen-class-implements false)
-              (reset! gen-class-implements-paren-depth -1)
-              (reset! gen-class-toggle 0)
-              (reset! gen-class-value-line-no @line-no))
+              (vreset! inside-gen-class-implements false)
+              (vreset! gen-class-implements-paren-depth -1)
+              (vreset! gen-class-toggle 0)
+              (vreset! gen-class-value-line-no @line-no))
 
-            (reset! require-macros-refer-node-idx -1)
-            (reset! require-macros-rename-idx -1)))
+            (vreset! require-macros-refer-node-idx -1)
+            (vreset! require-macros-rename-idx -1)))
 
         (let [is-comment-node2 (is-comment-node node)
               is-reader-comment-node2 (is-reader-comment-node node)
@@ -949,65 +977,65 @@
                    (> (count @single-line-comments) 0))]
 
           (when is-reader-comment-node2
-            (reset! inside-reader-comment true)
+            (vreset! inside-reader-comment true)
             (let [last-child (get-last-child-node-with-text node)]
-              (reset! id-of-last-node-inside-reader-comment (:id last-child))))
+              (vreset! id-of-last-node-inside-reader-comment (:id last-child))))
 
           (cond
             (> @skip-nodes-until-we-reach-this-id 0)
             (when (= (:id node) @skip-nodes-until-we-reach-this-id)
-              (reset! skip-nodes-until-we-reach-this-id -1)
+              (vreset! skip-nodes-until-we-reach-this-id -1)
               (when (= (:id node) @gen-class-value-last-node-id)
-                (reset! gen-class-value-line-no @line-no)
-                (reset! gen-class-value-last-node-id -1)))
+                (vreset! gen-class-value-line-no @line-no)
+                (vreset! gen-class-value-last-node-id -1)))
 
             (and @inside-require-form (= @require-symbol-idx -1) (= (:name node) "meta"))
             (let [metadata (get-metadata-strings-from-meta-node node)]
               (doseq [m metadata]
-                (swap! pending-require-metadata conj m))
+                (vswap! pending-require-metadata conj m))
               (when-let [body-node (get-body-node-from-meta-node node)]
-                (reset! skip-nodes-until-we-reach-this-id (:id body-node))))
+                (vreset! skip-nodes-until-we-reach-this-id (:id body-node))))
 
             @inside-ns-metadata-shorthand
             (cond
               (and (= (:name node) ".marker") (= (:text node) "^"))
-              (reset! next-token-node-is-metadata-true-key true)
+              (vreset! next-token-node-is-metadata-true-key true)
 
               (and @next-token-node-is-metadata-true-key is-token-node2)
               (do
                 (when-not (get @result "nsMetadata")
-                  (swap! result assoc "nsMetadata" []))
-                (swap! result update "nsMetadata" conj {"key" (:text node) "value" "true"})
-                (reset! next-token-node-is-metadata-true-key false)
-                (reset! inside-ns-metadata-shorthand false)))
+                  (vswap! result assoc "nsMetadata" []))
+                (vswap! result update "nsMetadata" conj {"key" (:text node) "value" "true"})
+                (vreset! next-token-node-is-metadata-true-key false)
+                (vreset! inside-ns-metadata-shorthand false)))
 
             @inside-ns-metadata-hash-map
             (cond
               (and @next-text-node-is-metadata-key (= (:name node) ".close") (= (:text node) "}"))
-              (reset! inside-ns-metadata-hash-map false)
+              (vreset! inside-ns-metadata-hash-map false)
 
               (and (not @next-text-node-is-metadata-key) (= (:name node) ".open") (= (:text node) "{"))
-              (reset! next-text-node-is-metadata-key true)
+              (vreset! next-text-node-is-metadata-key true)
 
               (and @next-text-node-is-metadata-key is-token-node2)
               (do
                 (when-not (get @result "nsMetadata")
-                  (swap! result assoc "nsMetadata" []))
-                (reset! tmp-metadata-key (:text node))
-                (reset! next-text-node-is-metadata-key false)
+                  (vswap! result assoc "nsMetadata" []))
+                (vreset! tmp-metadata-key (:text node))
+                (vreset! next-text-node-is-metadata-key false)
                 (let [next-non-ws (find-next-non-whitespace-node nodes-arr (inc @idx))]
-                  (reset! metadata-value-node-id (:id next-non-ws))))
+                  (vreset! metadata-value-node-id (:id next-non-ws))))
 
               (= (:id node) @metadata-value-node-id)
               (do
-                (swap! result update "nsMetadata" conj {"key" @tmp-metadata-key "value" (get-text-from-root-node node)})
-                (reset! tmp-metadata-key "")
-                (reset! next-text-node-is-metadata-key true)
-                (reset! metadata-value-node-id -1)
+                (vswap! result update "nsMetadata" conj {"key" @tmp-metadata-key "value" (get-text-from-root-node node)})
+                (vreset! tmp-metadata-key "")
+                (vreset! next-text-node-is-metadata-key true)
+                (vreset! metadata-value-node-id -1)
                 (loop [cand node]
                   (when (and cand (vector? (:children cand)) (seq (:children cand)))
                     (let [last-c (last (:children cand))]
-                      (reset! skip-nodes-until-we-reach-this-id (:id last-c))
+                      (vreset! skip-nodes-until-we-reach-this-id (:id last-c))
                       (recur last-c))))))
 
             (and (not @inside-ns-metadata-hash-map) (not @inside-ns-metadata-shorthand)
@@ -1017,46 +1045,46 @@
                 (let [node-after (find-next-node-with-text nodes-arr (+ @idx 2))]
                   (cond
                     (and node-after (= (:text node-after) "{"))
-                    (reset! inside-ns-metadata-hash-map true)
+                    (vreset! inside-ns-metadata-hash-map true)
 
                     (and node-after (is-token-node node-after))
-                    (reset! inside-ns-metadata-shorthand true)))))
+                    (vreset! inside-ns-metadata-shorthand true)))))
 
             (and @inside-ns-form (> @idx @ns-node-idx) (>= @paren-nesting-depth 1)
                  (not @beyond-ns-metadata) (not @inside-reader-comment)
                  (not @inside-ns-metadata-shorthand) (not @inside-ns-metadata-hash-map)
                  (= (:name node) ".open") (= (:text node) "{"))
             (do
-              (reset! inside-ns-metadata-hash-map true)
-              (reset! next-text-node-is-metadata-key true))
+              (vreset! inside-ns-metadata-hash-map true)
+              (vreset! next-text-node-is-metadata-key true))
 
             (and (> @idx @ns-node-idx) @next-text-node-is-ns-symbol is-token-node2 is-text-node)
             (do
-              (swap! result assoc "nsSymbol" (:text node))
-              (reset! ns-symbol-idx @idx)
-              (reset! next-text-node-is-ns-symbol false))
+              (vswap! result assoc "nsSymbol" (:text node))
+              (vreset! ns-symbol-idx @idx)
+              (vreset! next-text-node-is-ns-symbol false))
 
             (and @inside-reader-conditional (= @paren-nesting-depth @reader-conditional-paren-nesting-depth) (is-keyword-node node))
-            (reset! current-reader-conditional-platform (:text node))
+            (vreset! current-reader-conditional-platform (:text node))
 
             (and @inside-ns-form (> @idx @ns-node-idx) @prev-node-is-newline is-comment-node2)
-            (swap! single-line-comments conj (:text node))
+            (vswap! single-line-comments conj (:text node))
 
             (and @inside-require-form (< @active-require-idx 0) (= @require-form-line-no @line-no)
                  (= @require-symbol-idx -1) (= @refer-idx -1) (= @rename-idx -1) is-reader-comment-node2)
             (do
-              (swap! single-line-comments conj (get-text-from-root-node node))
-              (reset! pending-reader-comment-line-no @line-no))
+              (vswap! single-line-comments conj (get-text-from-root-node node))
+              (vreset! pending-reader-comment-line-no @line-no))
 
             (and reader-comment-merge-window-is-open is-comment-node2)
             (let [last-idx (dec (count @single-line-comments))]
-              (swap! single-line-comments update last-idx #(str % " " (:text node)))
-              (reset! pending-reader-comment-line-no -1))
+              (vswap! single-line-comments update last-idx #(str % " " (:text node)))
+              (vreset! pending-reader-comment-line-no -1))
 
             (and @inside-ns-form (> @idx @ns-node-idx) @prev-node-is-newline is-reader-comment-node2)
             (do
-              (swap! single-line-comments conj (get-text-from-root-node node))
-              (reset! pending-reader-comment-line-no @line-no))
+              (vswap! single-line-comments conj (get-text-from-root-node node))
+              (vreset! pending-reader-comment-line-no @line-no))
 
             (and (> @idx @ns-node-idx) (not @prev-node-is-newline) (or is-comment-node2 is-reader-comment-node2))
             (let [comment-at-end (if is-comment-node2 (:text node) (get-text-from-root-node node))]
@@ -1064,87 +1092,87 @@
                 (= @prefix-list-line-no @line-no)
                 (do
                   (when-not (get @prefix-list-comments @current-prefix-list-id)
-                    (swap! prefix-list-comments assoc @current-prefix-list-id {}))
-                  (swap! prefix-list-comments assoc-in [@current-prefix-list-id "commentAfter"] comment-at-end)
-                  (reset! line-of-last-comment-recording @line-no))
+                    (vswap! prefix-list-comments assoc @current-prefix-list-id {}))
+                  (vswap! prefix-list-comments assoc-in [@current-prefix-list-id "commentAfter"] comment-at-end)
+                  (vreset! line-of-last-comment-recording @line-no))
 
                 (and (= @require-form-line-no @line-no) (< @active-require-idx 0))
                 (do
-                  (swap! result assoc "requireCommentAfter" comment-at-end)
-                  (reset! line-of-last-comment-recording @line-no))
+                  (vswap! result assoc "requireCommentAfter" comment-at-end)
+                  (vreset! line-of-last-comment-recording @line-no))
 
                 (and (= @require-form-line-no @line-no) (>= @active-require-idx 0))
                 (do
-                  (swap! result assoc-in ["requires" @active-require-idx "commentAfter"] comment-at-end)
-                  (reset! line-of-last-comment-recording @line-no))
+                  (vswap! result assoc-in ["requires" @active-require-idx "commentAfter"] comment-at-end)
+                  (vreset! line-of-last-comment-recording @line-no))
 
                 (and (= @section-to-attach-eol-comments-to "refer-clojure") (get @result "referClojure"))
                 (do
-                  (swap! result assoc "referClojureCommentAfter" comment-at-end)
-                  (reset! line-of-last-comment-recording @line-no))
+                  (vswap! result assoc "referClojureCommentAfter" comment-at-end)
+                  (vreset! line-of-last-comment-recording @line-no))
 
                 (and (= @import-form-line-no @line-no) (not (get @result "importsObj")))
                 (do
-                  (swap! result assoc "importCommentAfter" comment-at-end)
-                  (reset! line-of-last-comment-recording @line-no))
+                  (vswap! result assoc "importCommentAfter" comment-at-end)
+                  (vreset! line-of-last-comment-recording @line-no))
 
                 (= @import-form-line-no @line-no)
                 (do
-                  (swap! result assoc-in ["importsObj" @active-import-package-name "commentAfter"] comment-at-end)
-                  (reset! line-of-last-comment-recording @line-no))
+                  (vswap! result assoc-in ["importsObj" @active-import-package-name "commentAfter"] comment-at-end)
+                  (vreset! line-of-last-comment-recording @line-no))
 
                 (= @require-macros-line-no @line-no)
                 (do
-                  (swap! result assoc-in ["requireMacros" @active-require-macros-idx "commentAfter"] comment-at-end)
-                  (reset! line-of-last-comment-recording @line-no))
+                  (vswap! result assoc-in ["requireMacros" @active-require-macros-idx "commentAfter"] comment-at-end)
+                  (vreset! line-of-last-comment-recording @line-no))
 
                 (= @gen-class-line-no @line-no)
                 (do
-                  (swap! result assoc-in ["genClass" "commentAfter"] comment-at-end)
-                  (reset! line-of-last-comment-recording @line-no))
+                  (vswap! result assoc-in ["genClass" "commentAfter"] comment-at-end)
+                  (vreset! line-of-last-comment-recording @line-no))
 
                 (= @gen-class-value-line-no @line-no)
                 (do
                   (if (vector? (get-in @result ["genClass" @gen-class-key-str]))
-                    (swap! result update-in ["genClass" @gen-class-key-str] vary-meta assoc "commentAfter" comment-at-end)
-                    (swap! result assoc-in ["genClass" @gen-class-key-str "commentAfter"] comment-at-end))
-                  (reset! line-of-last-comment-recording @line-no)))
+                    (vswap! result update-in ["genClass" @gen-class-key-str] vary-meta assoc "commentAfter" comment-at-end)
+                    (vswap! result assoc-in ["genClass" @gen-class-key-str "commentAfter"] comment-at-end))
+                  (vreset! line-of-last-comment-recording @line-no)))
 
               (when (and (not @inside-ns-form) (= @line-no @line-of-last-comment-recording))
-                (swap! result assoc "commentOutsideNsForm" comment-at-end)))
+                (vswap! result assoc "commentOutsideNsForm" comment-at-end)))
 
             @inside-reader-comment
             (when (= (:id node) @id-of-last-node-inside-reader-comment)
-              (reset! inside-reader-comment false)
-              (reset! id-of-last-node-inside-reader-comment -1))
+              (vreset! inside-reader-comment false)
+              (vreset! id-of-last-node-inside-reader-comment -1))
 
             (and @inside-require-form (= @idx @require-node-idx) (seq @single-line-comments))
             (do
-              (swap! result assoc "requireCommentsAbove" @single-line-comments)
-              (reset! single-line-comments []))
+              (vswap! result assoc "requireCommentsAbove" @single-line-comments)
+              (vreset! single-line-comments []))
 
             (and @inside-import-form (= @idx @import-node-idx) (seq @single-line-comments))
             (do
-              (swap! result assoc "importCommentsAbove" @single-line-comments)
-              (reset! single-line-comments []))
+              (vswap! result assoc "importCommentsAbove" @single-line-comments)
+              (vreset! single-line-comments []))
 
             (and @inside-refer-clojure-form (= @idx @refer-clojure-node-idx) (seq @single-line-comments))
             (do
-              (swap! result assoc "referClojureCommentsAbove" @single-line-comments)
-              (reset! single-line-comments []))
+              (vswap! result assoc "referClojureCommentsAbove" @single-line-comments)
+              (vreset! single-line-comments []))
 
             (and @inside-ns-form (> @idx @ns-node-idx) (= @paren-nesting-depth 1)
                  (not @beyond-ns-metadata) (not @inside-ns-metadata-shorthand)
                  (not @inside-ns-metadata-hash-map) (is-string-node node))
-            (swap! result assoc "docstring" (get-text-from-string-node node))
+            (vswap! result assoc "docstring" (get-text-from-string-node node))
 
             (and @inside-refer-clojure-form (> @idx @refer-clojure-node-idx) (is-exclude-keyword node))
             (do
               (when-not (get @result "referClojure")
-                (swap! result assoc "referClojure" {}))
+                (vswap! result assoc "referClojure" {}))
               (when-not (vector? (get-in @result ["referClojure" "exclude"]))
-                (swap! result assoc-in ["referClojure" "exclude"] []))
-              (reset! collect-refer-clojure-exclude-symbols true))
+                (vswap! result assoc-in ["referClojure" "exclude"] []))
+              (vreset! collect-refer-clojure-exclude-symbols true))
 
             (and (> @idx (inc @refer-clojure-node-idx)) @collect-refer-clojure-exclude-symbols
                  (>= @paren-nesting-depth 3) is-token-node2 is-text-node
@@ -1152,14 +1180,14 @@
             (let [sym-obj (cond-> {"symbol" (:text node)}
                             (and @inside-reader-conditional @current-reader-conditional-platform)
                             (assoc "platform" @current-reader-conditional-platform))]
-              (swap! result update-in ["referClojure" "exclude"] conj sym-obj))
+              (vswap! result update-in ["referClojure" "exclude"] conj sym-obj))
 
             (and @inside-refer-clojure-form (> @idx @refer-clojure-node-idx) (is-only-keyword node))
             (do
               (when-not (get @result "referClojure")
-                (swap! result assoc "referClojure" {}))
-              (swap! result assoc-in ["referClojure" "only"] [])
-              (reset! collect-refer-clojure-only-symbols true))
+                (vswap! result assoc "referClojure" {}))
+              (vswap! result assoc-in ["referClojure" "only"] [])
+              (vreset! collect-refer-clojure-only-symbols true))
 
             (and (> @idx (inc @refer-clojure-node-idx)) @collect-refer-clojure-only-symbols
                  (>= @paren-nesting-depth 3) is-token-node2 is-text-node
@@ -1167,177 +1195,177 @@
             (let [sym-obj (cond-> {"symbol" (:text node)}
                             (and @inside-reader-conditional @current-reader-conditional-platform)
                             (assoc "platform" @current-reader-conditional-platform))]
-              (swap! result update-in ["referClojure" "only"] conj sym-obj))
+              (vswap! result update-in ["referClojure" "only"] conj sym-obj))
 
             (and @inside-refer-clojure-form (> @idx @refer-clojure-node-idx) (is-rename-keyword node))
             (do
               (when-not (get @result "referClojure")
-                (swap! result assoc "referClojure" {}))
-              (swap! result assoc-in ["referClojure" "rename"] [])
-              (reset! collect-refer-clojure-rename-symbols true))
+                (vswap! result assoc "referClojure" {}))
+              (vswap! result assoc-in ["referClojure" "rename"] [])
+              (vreset! collect-refer-clojure-rename-symbols true))
 
             (and (> @idx (inc @refer-clojure-node-idx)) @collect-refer-clojure-rename-symbols
                  (>= @paren-nesting-depth 3) is-token-node2 is-text-node
                  (get @result "referClojure") (vector? (get-in @result ["referClojure" "rename"])))
             (do
-              (swap! renames-tmp conj (:text node))
+              (vswap! renames-tmp conj (:text node))
               (when (= (count @renames-tmp) 2)
                 (let [itm (cond-> {"fromSymbol" (first @renames-tmp)
                                    "toSymbol" (second @renames-tmp)}
                             (and @inside-reader-conditional @current-reader-conditional-platform)
                             (assoc "platform" @current-reader-conditional-platform))]
-                  (swap! result update-in ["referClojure" "rename"] conj itm)
-                  (reset! renames-tmp []))))
+                  (vswap! result update-in ["referClojure" "rename"] conj itm)
+                  (vreset! renames-tmp []))))
 
             (and (> @idx @require-node-idx) @inside-require-form is-token-node2 (is-as-keyword node))
-            (reset! next-token-is-as-symbol true)
+            (vreset! next-token-is-as-symbol true)
 
             (and (> @idx @require-node-idx) @inside-require-form @next-token-is-as-symbol is-token-node2 is-text-node)
             (do
-              (reset! next-token-is-as-symbol false)
-              (swap! result assoc-in ["requires" @active-require-idx "as"] (:text node)))
+              (vreset! next-token-is-as-symbol false)
+              (vswap! result assoc-in ["requires" @active-require-idx "as"] (:text node)))
 
             (and @inside-require-macros-form (not= @require-macros-refer-node-idx -1)
                  (> @idx @require-macros-refer-node-idx) is-token-node2 is-text-node)
             (do
               (when-not (vector? (get-in @result ["requireMacros" @active-require-macros-idx "refer"]))
-                (swap! result assoc-in ["requireMacros" @active-require-macros-idx "refer"] []))
+                (vswap! result assoc-in ["requireMacros" @active-require-macros-idx "refer"] []))
               (let [refer-obj (cond-> {"symbol" (:text node)}
                                 (and @inside-reader-conditional @current-reader-conditional-platform)
                                 (assoc "platform" @current-reader-conditional-platform))]
-                (swap! result update-in ["requireMacros" @active-require-macros-idx "refer"] conj refer-obj)))
+                (vswap! result update-in ["requireMacros" @active-require-macros-idx "refer"] conj refer-obj)))
 
             (and @inside-require-macros-form (not= @require-macros-as-node-idx -1)
                  (> @idx @require-macros-as-node-idx) is-token-node2 is-text-node)
             (do
-              (swap! result assoc-in ["requireMacros" @active-require-macros-idx "as"] (:text node))
-              (reset! require-macros-as-node-idx -1))
+              (vswap! result assoc-in ["requireMacros" @active-require-macros-idx "as"] (:text node))
+              (vreset! require-macros-as-node-idx -1))
 
             (and @inside-require-macros-form (not= @require-macros-rename-idx -1)
                  (> @idx @require-macros-rename-idx) is-token-node2 is-text-node)
             (do
               (when-not (vector? (get-in @result ["requireMacros" @active-require-macros-idx "rename"]))
-                (swap! result assoc-in ["requireMacros" @active-require-macros-idx "rename"] []))
-              (swap! renames-tmp conj (:text node))
+                (vswap! result assoc-in ["requireMacros" @active-require-macros-idx "rename"] []))
+              (vswap! renames-tmp conj (:text node))
               (when (= (count @renames-tmp) 2)
                 (let [itm (cond-> {"fromSymbol" (first @renames-tmp)
                                    "toSymbol" (second @renames-tmp)}
                             (and @inside-reader-conditional @current-reader-conditional-platform)
                             (assoc "platform" @current-reader-conditional-platform))]
-                  (swap! result update-in ["requireMacros" @active-require-macros-idx "rename"] conj itm)
-                  (reset! renames-tmp []))))
+                  (vswap! result update-in ["requireMacros" @active-require-macros-idx "rename"] conj itm)
+                  (vreset! renames-tmp []))))
 
             (and @inside-require-macros-form (> @idx @require-macros-node-idx) (is-refer-keyword node))
-            (reset! require-macros-refer-node-idx @idx)
+            (vreset! require-macros-refer-node-idx @idx)
 
             (and @inside-require-macros-form (> @idx @require-macros-node-idx) (is-as-keyword node))
-            (reset! require-macros-as-node-idx @idx)
+            (vreset! require-macros-as-node-idx @idx)
 
             (and @inside-require-macros-form (> @idx @require-macros-node-idx) (is-rename-keyword node))
             (do
-              (reset! require-macros-rename-idx @idx)
-              (reset! renames-tmp []))
+              (vreset! require-macros-rename-idx @idx)
+              (vreset! renames-tmp []))
 
             (and @inside-require-macros-form (> @idx @require-macros-node-idx) is-token-node2 is-text-node)
             (do
               (when-not (get @result "requireMacros")
-                (swap! result assoc "requireMacros" [])
+                (vswap! result assoc "requireMacros" [])
                 (when (seq @single-line-comments)
-                  (swap! result assoc "requireMacrosCommentsAbove" @single-line-comments)
-                  (reset! single-line-comments [])))
+                  (vswap! result assoc "requireMacrosCommentsAbove" @single-line-comments)
+                  (vreset! single-line-comments [])))
               (let [req-obj (cond-> {"symbol" (:text node)}
                               (seq @single-line-comments)
                               (assoc "commentsAbove" @single-line-comments)
                               (and @inside-reader-conditional @current-reader-conditional-platform)
                               (assoc "platform" @current-reader-conditional-platform))]
-                (reset! single-line-comments [])
-                (swap! result update "requireMacros" conj req-obj)
-                (swap! active-require-macros-idx inc)
-                (reset! require-macros-line-no @line-no)))
+                (vreset! single-line-comments [])
+                (vswap! result update "requireMacros" conj req-obj)
+                (vswap! active-require-macros-idx inc)
+                (vreset! require-macros-line-no @line-no)))
 
             (and (> @idx @require-node-idx) @inside-require-form is-token-node2 (is-include-macros-node node))
-            (reset! inside-include-macros true)
+            (vreset! inside-include-macros true)
 
             (and @inside-include-macros is-token-node2 (is-boolean-node node))
             (do
-              (swap! result assoc-in ["requires" @active-require-idx "includeMacros"] (= (:text node) "true"))
-              (reset! inside-include-macros false))
+              (vswap! result assoc-in ["requires" @active-require-idx "includeMacros"] (= (:text node) "true"))
+              (vreset! inside-include-macros false))
 
             (and (> @idx @require-node-idx) @inside-require-form is-token-node2 (is-refer-macros-keyword node))
             (do
-              (reset! refer-macros-idx @idx)
-              (reset! refer-macros-paren-nesting-depth @paren-nesting-depth))
+              (vreset! refer-macros-idx @idx)
+              (vreset! refer-macros-paren-nesting-depth @paren-nesting-depth))
 
             (and (> @idx @refer-macros-idx) @inside-require-form
                  (= @paren-nesting-depth (inc @refer-macros-paren-nesting-depth))
                  is-token-node2 is-text-node)
             (do
               (when-not (vector? (get-in @result ["requires" @active-require-idx "referMacros"]))
-                (swap! result assoc-in ["requires" @active-require-idx "referMacros"] []))
-              (swap! result update-in ["requires" @active-require-idx "referMacros"] conj (:text node)))
+                (vswap! result assoc-in ["requires" @active-require-idx "referMacros"] []))
+              (vswap! result update-in ["requires" @active-require-idx "referMacros"] conj (:text node)))
 
             (and (> @idx @require-node-idx) @inside-require-form is-token-node2 (is-refer-keyword node))
             (do
-              (reset! refer-idx @idx)
-              (reset! refer-paren-nesting-depth @paren-nesting-depth))
+              (vreset! refer-idx @idx)
+              (vreset! refer-paren-nesting-depth @paren-nesting-depth))
 
             (and (> @idx @require-node-idx) @inside-require-form is-token-node2 (is-default-keyword node))
-            (reset! next-token-is-require-default-symbol true)
+            (vreset! next-token-is-require-default-symbol true)
 
             (and (> @idx @require-node-idx) @inside-require-form is-token-node2
                  @collect-require-exclude-symbols (> @paren-nesting-depth @require-exclude-symbol-paren-depth))
-            (swap! result update-in ["requires" @active-require-idx "exclude"] conj {"symbol" (:text node)})
+            (vswap! result update-in ["requires" @active-require-idx "exclude"] conj {"symbol" (:text node)})
 
             (and (> @idx @require-node-idx) @inside-require-form is-token-node2 (is-exclude-keyword node))
             (do
-              (swap! result assoc-in ["requires" @active-require-idx "exclude"] [])
-              (reset! collect-require-exclude-symbols true)
-              (reset! require-exclude-symbol-paren-depth @paren-nesting-depth))
+              (vswap! result assoc-in ["requires" @active-require-idx "exclude"] [])
+              (vreset! collect-require-exclude-symbols true)
+              (vreset! require-exclude-symbol-paren-depth @paren-nesting-depth))
 
             (and (> @idx @require-node-idx) @inside-require-form is-token-node2 (is-as-alias-keyword node))
             (let [next-sym (find-next-token-inside-require-form nodes-arr (inc @idx))]
-              (swap! result assoc-in ["requires" @active-require-idx "asAlias"] (:text next-sym)))
+              (vswap! result assoc-in ["requires" @active-require-idx "asAlias"] (:text next-sym)))
 
             (and (> @idx @refer-idx) @inside-require-form is-token-node2 (is-all-node node))
-            (swap! result assoc-in ["requires" @active-require-idx "refer"] "all")
+            (vswap! result assoc-in ["requires" @active-require-idx "refer"] "all")
 
             (and (> @idx @refer-idx) @inside-require-form is-token-node2 @next-token-is-require-default-symbol)
             (do
-              (swap! result assoc-in ["requires" @active-require-idx "default"] (:text node))
-              (reset! next-token-is-require-default-symbol false))
+              (vswap! result assoc-in ["requires" @active-require-idx "default"] (:text node))
+              (vreset! next-token-is-require-default-symbol false))
 
             (and @inside-require-form @inside-require-list (= @rename-idx -1) (is-rename-keyword node))
             (do
-              (reset! rename-idx @idx)
-              (reset! rename-paren-nesting-depth @paren-nesting-depth)
-              (reset! renames-tmp []))
+              (vreset! rename-idx @idx)
+              (vreset! rename-paren-nesting-depth @paren-nesting-depth)
+              (vreset! renames-tmp []))
 
             (and @inside-require-form @inside-require-list (> @rename-idx 0) (> @idx @rename-idx)
                  (> @paren-nesting-depth @rename-paren-nesting-depth) is-token-node2 is-text-node)
             (do
-              (swap! renames-tmp conj (:text node))
+              (vswap! renames-tmp conj (:text node))
               (when (= (count @renames-tmp) 2)
                 (let [itm (cond-> {"fromSymbol" (first @renames-tmp)
                                    "toSymbol" (second @renames-tmp)}
                             (and @inside-reader-conditional @current-reader-conditional-platform)
                             (assoc "platform" @current-reader-conditional-platform))]
                   (when-not (vector? (get-in @result ["requires" @active-require-idx "rename"]))
-                    (swap! result assoc-in ["requires" @active-require-idx "rename"] []))
-                  (swap! result update-in ["requires" @active-require-idx "rename"] conj itm)
-                  (reset! renames-tmp []))))
+                    (vswap! result assoc-in ["requires" @active-require-idx "rename"] []))
+                  (vswap! result update-in ["requires" @active-require-idx "rename"] conj itm)
+                  (vreset! renames-tmp []))))
 
             (and (> @idx @refer-idx) @inside-require-form (not= @refer-paren-nesting-depth -1)
                  (> @paren-nesting-depth @refer-paren-nesting-depth) is-token-node2 is-text-node)
             (do
               (when-not (vector? (get-in @result ["requires" @active-require-idx "refer"]))
-                (swap! result assoc-in ["requires" @active-require-idx "refer"] []))
-              (swap! result update-in ["requires" @active-require-idx "refer"] conj {"symbol" (:text node)}))
+                (vswap! result assoc-in ["requires" @active-require-idx "refer"] []))
+              (vswap! result update-in ["requires" @active-require-idx "refer"] conj {"symbol" (:text node)}))
 
             (and @inside-require-form (not @inside-require-list) (> @idx @require-node-idx)
                  is-token-node2 is-text-node (= @require-symbol-idx -1) (not (is-keyword-node node)))
             (do
               (when-not (vector? (get @result "requires"))
-                (swap! result assoc "requires" []))
+                (vswap! result assoc "requires" []))
               (let [req-obj (cond-> {"symbol" (:text node)}
                               (seq @pending-require-metadata)
                               (assoc "metadata" @pending-require-metadata)
@@ -1345,45 +1373,45 @@
                               (assoc "commentsAbove" @single-line-comments)
                               (and @inside-reader-conditional @current-reader-conditional-platform)
                               (assoc "platform" @current-reader-conditional-platform))]
-                (reset! pending-require-metadata [])
-                (reset! single-line-comments [])
-                (swap! result update "requires" conj req-obj)
-                (swap! active-require-idx inc)
-                (reset! require-form-line-no @line-no)))
+                (vreset! pending-require-metadata [])
+                (vreset! single-line-comments [])
+                (vswap! result update "requires" conj req-obj)
+                (vswap! active-require-idx inc)
+                (vreset! require-form-line-no @line-no)))
 
             (and @inside-prefix-list is-token-node2 is-text-node)
             (do
               (when-not (vector? (get @result "requires"))
-                (swap! result assoc "requires" []))
+                (vswap! result assoc "requires" []))
               (let [ns-str (str @prefix-list-prefix "." (:text node))
                     req-obj (cond-> {"symbol" ns-str
                                      "prefixListId" @current-prefix-list-id}
                               (seq @pending-require-metadata)
                               (assoc "metadata" @pending-require-metadata))]
-                (reset! pending-require-metadata [])
-                (swap! result update "requires" conj req-obj)
-                (swap! active-require-idx inc)
-                (reset! require-symbol-idx @idx)
-                (reset! require-form-line-no @line-no)))
+                (vreset! pending-require-metadata [])
+                (vswap! result update "requires" conj req-obj)
+                (vswap! active-require-idx inc)
+                (vreset! require-symbol-idx @idx)
+                (vreset! require-form-line-no @line-no)))
 
             (and @inside-require-form @inside-require-list (> @idx @require-node-idx)
                  (= @refer-idx -1) (= @rename-idx -1) is-token-node2 is-text-node
                  (= @require-symbol-idx -1) (not (is-keyword-node node)))
             (do
               (when-not (vector? (get @result "requires"))
-                (swap! result assoc "requires" []))
+                (vswap! result assoc "requires" []))
               (let [next-tok (find-next-token-inside-require-form nodes-arr (inc @idx))
                     is-prefix-list (and next-tok (not (is-keyword-node next-tok)))]
                 (if is-prefix-list
                   (let [pl-id (parser/create-id)]
-                    (reset! inside-prefix-list true)
-                    (reset! prefix-list-paren-nesting-depth @paren-nesting-depth)
-                    (reset! prefix-list-line-no @line-no)
-                    (reset! prefix-list-prefix (:text node))
-                    (reset! current-prefix-list-id pl-id)
+                    (vreset! inside-prefix-list true)
+                    (vreset! prefix-list-paren-nesting-depth @paren-nesting-depth)
+                    (vreset! prefix-list-line-no @line-no)
+                    (vreset! prefix-list-prefix (:text node))
+                    (vreset! current-prefix-list-id pl-id)
                     (when (seq @single-line-comments)
-                      (swap! prefix-list-comments assoc pl-id {"commentsAbove" @single-line-comments})
-                      (reset! single-line-comments [])))
+                      (vswap! prefix-list-comments assoc pl-id {"commentsAbove" @single-line-comments})
+                      (vreset! single-line-comments [])))
                   (let [req-obj (cond-> {"symbol" (:text node)}
                                   (seq @pending-require-metadata)
                                   (assoc "metadata" @pending-require-metadata)
@@ -1391,19 +1419,19 @@
                                   (assoc "commentsAbove" @single-line-comments)
                                   (and @inside-reader-conditional @current-reader-conditional-platform)
                                   (assoc "platform" @current-reader-conditional-platform))]
-                    (reset! pending-require-metadata [])
-                    (reset! single-line-comments [])
-                    (swap! result update "requires" conj req-obj)
-                    (swap! active-require-idx inc)
-                    (reset! require-symbol-idx @idx)
-                    (reset! require-form-line-no @line-no)
-                    (reset! inside-prefix-list false)
-                    (reset! prefix-list-line-no -1)))))
+                    (vreset! pending-require-metadata [])
+                    (vreset! single-line-comments [])
+                    (vswap! result update "requires" conj req-obj)
+                    (vswap! active-require-idx inc)
+                    (vreset! require-symbol-idx @idx)
+                    (vreset! require-form-line-no @line-no)
+                    (vreset! inside-prefix-list false)
+                    (vreset! prefix-list-line-no -1)))))
 
             (and @inside-require-form @inside-require-list (> @idx @require-node-idx) (is-string-node node))
             (do
               (when-not (vector? (get @result "requires"))
-                (swap! result assoc "requires" []))
+                (vswap! result assoc "requires" []))
               (let [req-obj (cond-> {"symbol" (str "\"" (get-text-from-string-node node) "\"")
                                      "symbolIsString" true}
                               (seq @pending-require-metadata)
@@ -1412,46 +1440,46 @@
                               (assoc "commentsAbove" @single-line-comments)
                               (and @inside-reader-conditional @current-reader-conditional-platform)
                               (assoc "platform" @current-reader-conditional-platform))]
-                (reset! pending-require-metadata [])
-                (reset! single-line-comments [])
-                (swap! result update "requires" conj req-obj)
-                (swap! active-require-idx inc)
-                (reset! require-form-line-no @line-no)))
+                (vreset! pending-require-metadata [])
+                (vreset! single-line-comments [])
+                (vswap! result update "requires" conj req-obj)
+                (vswap! active-require-idx inc)
+                (vreset! require-form-line-no @line-no)))
 
             (and @inside-import-form (> @idx @import-node-idx) (not @inside-import-package-list) is-token-node2 is-text-node)
             (do
               (when-not (get @result "importsObj")
-                (swap! result assoc "importsObj" {}))
+                (vswap! result assoc "importsObj" {}))
               (let [pkg-parsed (parse-java-package-with-class (:text node))
                     pkg-name (get pkg-parsed "package")
                     class-name (get pkg-parsed "className")]
                 (when-not (get-in @result ["importsObj" pkg-name])
-                  (swap! result assoc-in ["importsObj" pkg-name] {"classes" []}))
-                (swap! result update-in ["importsObj" pkg-name "classes"] conj class-name)
-                (reset! active-import-package-name pkg-name)
-                (reset! import-form-line-no @line-no)
+                  (vswap! result assoc-in ["importsObj" pkg-name] {"classes" []}))
+                (vswap! result update-in ["importsObj" pkg-name "classes"] conj class-name)
+                (vreset! active-import-package-name pkg-name)
+                (vreset! import-form-line-no @line-no)
                 (when (seq @single-line-comments)
-                  (swap! result assoc-in ["importsObj" pkg-name "commentsAbove"] @single-line-comments)
-                  (reset! single-line-comments []))
+                  (vswap! result assoc-in ["importsObj" pkg-name "commentsAbove"] @single-line-comments)
+                  (vreset! single-line-comments []))
                 (when (and @inside-reader-conditional @current-reader-conditional-platform)
-                  (swap! result assoc-in ["importsObj" pkg-name "platform"] @current-reader-conditional-platform))))
+                  (vswap! result assoc-in ["importsObj" pkg-name "platform"] @current-reader-conditional-platform))))
 
             (and @inside-import-package-list is-token-node2 is-text-node)
             (if-not @import-package-list-first-token
               (let [pkg-name (:text node)]
-                (reset! import-package-list-first-token pkg-name)
-                (reset! active-import-package-name pkg-name)
-                (reset! import-form-line-no @line-no)
+                (vreset! import-package-list-first-token pkg-name)
+                (vreset! active-import-package-name pkg-name)
+                (vreset! import-form-line-no @line-no)
                 (when-not (get @result "importsObj")
-                  (swap! result assoc "importsObj" {}))
+                  (vswap! result assoc "importsObj" {}))
                 (when-not (get-in @result ["importsObj" pkg-name])
-                  (swap! result assoc-in ["importsObj" pkg-name] {"classes" []}))
+                  (vswap! result assoc-in ["importsObj" pkg-name] {"classes" []}))
                 (when (seq @single-line-comments)
-                  (swap! result assoc-in ["importsObj" pkg-name "commentsAbove"] @single-line-comments)
-                  (reset! single-line-comments []))
+                  (vswap! result assoc-in ["importsObj" pkg-name "commentsAbove"] @single-line-comments)
+                  (vreset! single-line-comments []))
                 (when (and @inside-reader-conditional @current-reader-conditional-platform)
-                  (swap! result assoc-in ["importsObj" pkg-name "platform"] @current-reader-conditional-platform)))
-              (swap! result update-in ["importsObj" @import-package-list-first-token "classes"] conj (:text node)))
+                  (vswap! result assoc-in ["importsObj" pkg-name "platform"] @current-reader-conditional-platform)))
+              (vswap! result update-in ["importsObj" @import-package-list-first-token "classes"] conj (:text node)))
 
             (and @inside-gen-class @inside-gen-class-implements (> @idx @gen-class-node-idx)
                  (= @gen-class-toggle 1) (= @gen-class-key-str "implements")
@@ -1462,41 +1490,41 @@
               (let [sym-obj (cond-> {"symbol" symbol}
                               (and @inside-reader-conditional @current-reader-conditional-platform)
                               (assoc "platform" @current-reader-conditional-platform))]
-                (swap! result update-in ["genClass" "implements"] conj sym-obj)
+                (vswap! result update-in ["genClass" "implements"] conj sym-obj)
                 (when-not is-token-node2
                   (let [last-node (get-last-child-node-with-text node)]
-                    (reset! skip-nodes-until-we-reach-this-id (:id last-node))))))
+                    (vreset! skip-nodes-until-we-reach-this-id (:id last-node))))))
 
             (and @inside-gen-class (= @idx @gen-class-node-idx))
             (do
-              (swap! result assoc "genClass" {"isEmpty" true})
+              (vswap! result assoc "genClass" {"isEmpty" true})
               (when (and @inside-reader-conditional @current-reader-conditional-platform)
-                (swap! result assoc-in ["genClass" "platform"] @current-reader-conditional-platform))
+                (vswap! result assoc-in ["genClass" "platform"] @current-reader-conditional-platform))
               (when (seq @single-line-comments)
-                (swap! result assoc-in ["genClass" "commentsAbove"] @single-line-comments)
-                (reset! single-line-comments []))
-              (reset! gen-class-line-no @line-no))
+                (vswap! result assoc-in ["genClass" "commentsAbove"] @single-line-comments)
+                (vreset! single-line-comments []))
+              (vreset! gen-class-line-no @line-no))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) is-text-node
                  (= @gen-class-toggle 0) (is-gen-class-keyword node))
             (do
-              (swap! result assoc-in ["genClass" "isEmpty"] false)
+              (vswap! result assoc-in ["genClass" "isEmpty"] false)
               (let [k-str (subs (:text node) 1)]
-                (reset! gen-class-key-str k-str)
-                (swap! result assoc-in ["genClass" k-str] {})
+                (vreset! gen-class-key-str k-str)
+                (vswap! result assoc-in ["genClass" k-str] {})
                 (when (seq @single-line-comments)
-                  (swap! result assoc-in ["genClass" k-str "commentsAbove"] @single-line-comments)
-                  (reset! single-line-comments []))
-                (reset! gen-class-toggle 1)))
+                  (vswap! result assoc-in ["genClass" k-str "commentsAbove"] @single-line-comments)
+                  (vreset! single-line-comments []))
+                (vreset! gen-class-toggle 1)))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (= @gen-class-key-str "prefix") (is-string-node node))
             (do
-              (swap! result assoc-in ["genClass" "prefix" "value"] (get-gen-class-symbol-text node))
-              (reset! gen-class-toggle 0)
+              (vswap! result assoc-in ["genClass" "prefix" "value"] (get-gen-class-symbol-text node))
+              (vreset! gen-class-toggle 0)
               (let [last-node (get-last-child-node-with-text node)]
-                (reset! skip-nodes-until-we-reach-this-id (:id last-node))
-                (reset! gen-class-value-last-node-id (:id last-node))))
+                (vreset! skip-nodes-until-we-reach-this-id (:id last-node))
+                (vreset! gen-class-value-last-node-id (:id last-node))))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (is-gen-class-name-key @gen-class-key-str) (= (:name node) "meta"))
@@ -1505,41 +1533,41 @@
               (when-not val
                 (throw (Exception. (str ":gen-class :" @gen-class-key-str " must be a symbol or string."))))
               (when (and (string? (:metadata val-form)) (not= (:metadata val-form) ""))
-                (swap! result assoc-in ["genClass" @gen-class-key-str "metadata"] (:metadata val-form)))
-              (swap! result assoc-in ["genClass" @gen-class-key-str "value"] val)
-              (reset! gen-class-toggle 0)
+                (vswap! result assoc-in ["genClass" @gen-class-key-str "metadata"] (:metadata val-form)))
+              (vswap! result assoc-in ["genClass" @gen-class-key-str "value"] val)
+              (vreset! gen-class-toggle 0)
               (let [last-node (get-last-child-node-with-text node)]
-                (reset! skip-nodes-until-we-reach-this-id (:id last-node))
-                (reset! gen-class-value-last-node-id (:id last-node))))
+                (vreset! skip-nodes-until-we-reach-this-id (:id last-node))
+                (vreset! gen-class-value-last-node-id (:id last-node))))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (is-gen-class-name-key @gen-class-key-str) (or is-token-node2 (is-string-node node)))
             (do
-              (swap! result assoc-in ["genClass" @gen-class-key-str "value"] (get-gen-class-symbol-text node))
-              (reset! gen-class-toggle 0)
+              (vswap! result assoc-in ["genClass" @gen-class-key-str "value"] (get-gen-class-symbol-text node))
+              (vreset! gen-class-toggle 0)
               (if (is-string-node node)
                 (let [last-node (get-last-child-node-with-text node)]
-                  (reset! skip-nodes-until-we-reach-this-id (:id last-node))
-                  (reset! gen-class-value-last-node-id (:id last-node)))
-                (reset! gen-class-value-line-no @line-no)))
+                  (vreset! skip-nodes-until-we-reach-this-id (:id last-node))
+                  (vreset! gen-class-value-last-node-id (:id last-node)))
+                (vreset! gen-class-value-line-no @line-no)))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (= @gen-class-key-str "constructors") (is-map-literal-node node))
             (do
-              (swap! result assoc-in ["genClass" "constructors" "value"] (parse-gen-class-constructors node))
-              (reset! gen-class-toggle 0)
+              (vswap! result assoc-in ["genClass" "constructors" "value"] (parse-gen-class-constructors node))
+              (vreset! gen-class-toggle 0)
               (let [last-node (get-last-child-node-with-text node)]
-                (reset! skip-nodes-until-we-reach-this-id (:id last-node))
-                (reset! gen-class-value-last-node-id (:id last-node))))
+                (vreset! skip-nodes-until-we-reach-this-id (:id last-node))
+                (vreset! gen-class-value-last-node-id (:id last-node))))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (= @gen-class-key-str "methods") (is-vector-literal-node node))
             (do
-              (swap! result assoc-in ["genClass" "methods" "value"] (parse-gen-class-methods node))
-              (reset! gen-class-toggle 0)
+              (vswap! result assoc-in ["genClass" "methods" "value"] (parse-gen-class-methods node))
+              (vreset! gen-class-toggle 0)
               (let [last-node (get-last-child-node-with-text node)]
-                (reset! skip-nodes-until-we-reach-this-id (:id last-node))
-                (reset! gen-class-value-last-node-id (:id last-node))))
+                (vreset! skip-nodes-until-we-reach-this-id (:id last-node))
+                (vreset! gen-class-value-last-node-id (:id last-node))))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (= @gen-class-key-str "methods") (node-contains-text-and-not-whitespace node))
@@ -1548,11 +1576,11 @@
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (= @gen-class-key-str "exposes") (is-map-literal-node node))
             (do
-              (swap! result assoc-in ["genClass" "exposes" "value"] (parse-gen-class-exposes node))
-              (reset! gen-class-toggle 0)
+              (vswap! result assoc-in ["genClass" "exposes" "value"] (parse-gen-class-exposes node))
+              (vreset! gen-class-toggle 0)
               (let [last-node (get-last-child-node-with-text node)]
-                (reset! skip-nodes-until-we-reach-this-id (:id last-node))
-                (reset! gen-class-value-last-node-id (:id last-node))))
+                (vreset! skip-nodes-until-we-reach-this-id (:id last-node))
+                (vreset! gen-class-value-last-node-id (:id last-node))))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (= @gen-class-key-str "exposes") (node-contains-text-and-not-whitespace node))
@@ -1561,11 +1589,11 @@
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (= @gen-class-key-str "exposes-methods") (is-map-literal-node node))
             (do
-              (swap! result assoc-in ["genClass" "exposes-methods" "value"] (parse-gen-class-exposes-methods node))
-              (reset! gen-class-toggle 0)
+              (vswap! result assoc-in ["genClass" "exposes-methods" "value"] (parse-gen-class-exposes-methods node))
+              (vreset! gen-class-toggle 0)
               (let [last-node (get-last-child-node-with-text node)]
-                (reset! skip-nodes-until-we-reach-this-id (:id last-node))
-                (reset! gen-class-value-last-node-id (:id last-node))))
+                (vreset! skip-nodes-until-we-reach-this-id (:id last-node))
+                (vreset! gen-class-value-last-node-id (:id last-node))))
 
             (and @inside-gen-class (> @idx @gen-class-node-idx) (= @gen-class-toggle 1)
                  (= @gen-class-key-str "exposes-methods") (node-contains-text-and-not-whitespace node))
@@ -1575,26 +1603,26 @@
                  (= @gen-class-toggle 1) (is-gen-class-boolean-key @gen-class-key-str))
             (do
               (if (= (:text node) "true")
-                (swap! result assoc-in ["genClass" @gen-class-key-str "value"] true)
+                (vswap! result assoc-in ["genClass" @gen-class-key-str "value"] true)
                 (when (= (:text node) "false")
-                  (swap! result assoc-in ["genClass" @gen-class-key-str "value"] false)))
-              (reset! gen-class-toggle 0)
-              (reset! gen-class-value-line-no @line-no))
+                  (vswap! result assoc-in ["genClass" @gen-class-key-str "value"] false)))
+              (vreset! gen-class-toggle 0)
+              (vreset! gen-class-value-line-no @line-no))
 
             (and @inside-ns-form is-token-node2 (>= @paren-nesting-depth 1) (is-use-node node))
             (throw (Exception. "Standard Clojure Style does not support :use inside of the ns form. Please refactor with :require as appropriate."))))
 
         (when current-node-is-newline
-          (swap! line-no inc))
-        (reset! prev-node-is-newline current-node-is-newline)
+          (vswap! line-no inc))
+        (vreset! prev-node-is-newline current-node-is-newline)
 
-        (swap! idx inc)
+        (vswap! idx inc)
 
         (cond
           (>= @idx num-nodes)
-          (reset! continue-parsing-ns-form false)
+          (vreset! continue-parsing-ns-form false)
 
           (and (> @ns-node-idx 0) (not @inside-ns-form) (>= @line-no (+ @ns-form-ends-line-idx 2)))
-          (reset! continue-parsing-ns-form false))))
+          (vreset! continue-parsing-ns-form false))))
 
     (sort-ns-result @result @prefix-list-comments)))
