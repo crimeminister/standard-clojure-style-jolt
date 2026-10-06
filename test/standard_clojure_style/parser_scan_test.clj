@@ -6,7 +6,7 @@
    [standard-clojure-style.parser :as p]))
 
 (def alphabet
-  (str "()[]{}\"@~^;`#'\\,: \n\r\t\f" p/whitespace-unicodes "abz09-_./?!<>=+*%&|$"))
+  (str "()[]{}\"@~^;`#'\\,: \n\r\t\f\u0085" p/whitespace-unicodes "abz09-_./?!<>=+*%&|$"))
 
 ;; a fixed-seed LCG, so a failure reproduces
 (defn make-rng [seed]
@@ -37,6 +37,7 @@
     (re-pattern (str "^[" p/whitespace-chars "]+"))
     #(scan-end p/scan-whitespace %1 %2)]
    ["comment" #"^;[^\n]*" #(scan-end p/scan-comment %1 %2)]
+   ["string body" #"^([^\"\\]+|\\.)+" #(scan-end p/scan-string-body %1 %2)]
    ["string open" #"^#?\""
     #(literals-end (p/Literals {:strs ["#\"" "\""]}) %1 %2)]
    ["parens open" #"^(#\?@|#\?|#=|#)?\("

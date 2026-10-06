@@ -53,12 +53,6 @@
       false
       (boolean (str/index-of s "," last-nl)))))
 
-(defn has-commas-after-newline [node]
-  (and (ns-parser/is-whitespace-node node) (txt-has-commas-after-newline (:text node))))
-
-(defn is-newline-node-with-comma-on-next-line [node]
-  (and (ns-parser/is-newline-node node) (txt-has-commas-after-newline (:text node))))
-
 ;; -----------------------------------------------------------------------------
 ;; Namespace Formatter Helpers
 
@@ -759,27 +753,34 @@
 (defmacro ^:private kind? [kinds i k]
   `(not (zero? (bit-and (aget ~kinds ~i) (kind-bit ~k)))))
 
-;; Every predicate past the first two holds only for one :name, so dispatch on
-;; it rather than asking all of them.
+;; node-kind answers what the ns-parser predicates would, but reads the node's
+;; :name and :text once: asked through the predicates, each question re-reads
+;; them, and the predicates re-ask each other.
 (defn node-kind [m]
-  (let [k (if (ns-parser/node-contains-text m)
+  (let [txt (:text m)
+        has-text (and (string? txt) (not= txt ""))
+        k (if has-text
             (cond-> (kind-bit :text)
-              (ns-parser/is-node-with-non-blank-text m) (bit-or (kind-bit :non-blank-text)))
+              (not (identical? (.charAt ^String txt 0) \space)) (bit-or (kind-bit :non-blank-text)))
             0)]
     (case (:name m)
       "whitespace"
-      (cond-> (bit-or k (kind-bit :whitespace))
-        (ns-parser/is-newline-node m) (bit-or (kind-bit :newline))
-        (has-commas-after-newline m) (bit-or (kind-bit :commas-after-newline))
-        (is-newline-node-with-comma-on-next-line m) (bit-or (kind-bit :newline-with-comma))
-        (ns-parser/is-comma-node m) (bit-or (kind-bit :comma)))
+      (if (string? txt)
+        (cond-> (bit-or k (kind-bit :whitespace))
+          (str/includes? txt "\n") (bit-or (kind-bit :newline))
+          ;; only a newline can have commas after it
+          (txt-has-commas-after-newline txt) (bit-or (kind-bit :commas-after-newline)
+                                                     (kind-bit :newline-with-comma))
+          (str/includes? txt ",") (bit-or (kind-bit :comma)))
+        (bit-or k (kind-bit :whitespace)))
 
       "comment" (bit-or k (kind-bit :comment))
 
       "token"
-      (cond-> (bit-or k (kind-bit :token))
-        (ns-parser/is-ns-node m) (bit-or (kind-bit :ns))
-        (ns-parser/is-standard-clj-ignore-keyword m) (bit-or (kind-bit :ignore-keyword)))
+      (case txt
+        "ns" (bit-or k (kind-bit :token) (kind-bit :ns))
+        ":standard-clj/ignore" (bit-or k (kind-bit :token) (kind-bit :ignore-keyword))
+        (bit-or k (kind-bit :token)))
 
       ".tag" (bit-or k (kind-bit :tag))
 
@@ -788,8 +789,9 @@
         (ns-parser/is-paren-opener m) (bit-or (kind-bit :paren-opener)))
 
       ".close"
-      (cond-> k
-        (ns-parser/is-paren-closer m) (bit-or (kind-bit :paren-closer)))
+      (case txt
+        (")" "]" "}") (bit-or k (kind-bit :paren-closer))
+        k)
 
       k)))
 
@@ -802,13 +804,17 @@
         ;; ns-parser predicates read it. The bookkeeping upstream keeps on the
         ;; node objects themselves lives in the arrays beside it.
         ^objects nodes (object-array nodes-arr)
-        ^longs kinds (long-array (map node-kind nodes-arr))
+        ^longs kinds (let [a (long-array num-nodes)]
+                       (dotimes [i num-nodes]
+                         (aset a i (long (node-kind (aget nodes i)))))
+                       a)
         ^longs orig-col-idx (long-array num-nodes -1)
         ^longs printed-col-idx (long-array num-nodes -1)
         ^objects was-slurped-up (object-array num-nodes)
         ;; paren openers only
         ^longs paren-opener-line-idx (long-array num-nodes -1)
         ^objects opening-line-nodes (object-array num-nodes)
+        ;; filled in on first use: most openers never start a line inside them
         ^objects next-with-text-skipping-meta (object-array num-nodes)
         ^objects rule3-active (object-array num-nodes)
         ^longs rule3-num-spaces (long-array num-nodes)
@@ -832,6 +838,14 @@
         nodes-we-have-printed-on-this-line (volatile! [])]
 
     (letfn [(node-at [i] (aget nodes i))
+
+            (next-text-skipping-meta [opener-i]
+              (let [cached (aget next-with-text-skipping-meta opener-i)]
+                (if (some? cached)
+                  (when-not (identical? cached ::none) cached)
+                  (let [found (ns-parser/find-next-text-node-skipping-meta nodes-arr (inc opener-i))]
+                    (aset next-with-text-skipping-meta opener-i (if (some? found) found ::none))
+                    found))))
 
             (set-text! [i txt]
               (let [m (assoc (aget nodes i) :text txt)]
@@ -946,7 +960,6 @@
 
                       (vswap! paren-nesting-depth inc)
 
-                      (aset next-with-text-skipping-meta i (ns-parser/find-next-text-node-skipping-meta nodes-arr (inc i)))
                       (aset paren-opener-line-idx i (long @line-idx))
                       (aset opening-line-nodes i [])
                       (aset rule3-active i false)
@@ -1093,7 +1106,7 @@
                                   (if-not top
                                     0
                                     (let [opener (node-at top)
-                                          next-node (aget next-with-text-skipping-meta top)
+                                          next-node (next-text-skipping-meta top)
                                           opener-col (aget printed-col-idx top)]
                                       (cond
                                         (ns-parser/is-reader-conditional-opener opener)

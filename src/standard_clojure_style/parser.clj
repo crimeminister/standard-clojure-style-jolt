@@ -24,6 +24,30 @@
    :_wasSlurpedUp false})
 
 ;; -----------------------------------------------------------------------------
+;; Character Helpers
+
+;; Comparing chars with = or testing a char set with contains? costs tens of
+;; times more than a case dispatch, and the scanners do it for every char of the
+;; input.
+
+(defmacro char-in?
+  "True when ch is one of the chars of chars, a string or the name of a var
+  holding one, as a case dispatch."
+  [ch chars]
+  (let [chars (if (symbol? chars) @(resolve chars) chars)]
+    `(case ~ch ~(apply list (distinct chars)) true false)))
+
+(defn starts-at?
+  "True when txt holds s at pos."
+  [^String txt ^String s pos]
+  (let [n (.length s)]
+    (and (<= (+ pos n) (.length txt))
+         (loop [i 0]
+           (or (>= i n)
+               (and (identical? (.charAt s i) (.charAt txt (+ pos i)))
+                    (recur (inc i))))))))
+
+;; -----------------------------------------------------------------------------
 ;; Parser Combinators
 
 (defn append-children [children-vec node]
@@ -83,7 +107,7 @@
      (fn [^String txt pos]
        (let [txt-len (.length txt)]
          (if (and (< pos txt-len)
-                  (= (.charAt txt pos) target-ch))
+                  (identical? (.charAt txt pos) target-ch))
            (make-node node-name pos (inc pos) target-char nil)
            nil)))}))
 
@@ -99,7 +123,7 @@
        (let [txt-len (.length txt)]
          (if (< pos txt-len)
            (let [ch (.charAt txt pos)]
-             (if (not= ch target-ch)
+             (if-not (identical? ch target-ch)
                (make-node node-name pos (inc pos) (subs txt pos (inc pos)) nil)
                nil))
            nil)))}))
@@ -111,15 +135,8 @@
     {:name node-name
      :parse
      (fn [^String txt pos]
-       (let [txt-len (.length txt)]
-         (if (<= (+ pos target-len) txt-len)
-           (loop [i 0]
-             (if (< i target-len)
-               (if (= (.charAt target-str i) (.charAt txt (+ pos i)))
-                 (recur (inc i))
-                 nil)
-               (make-node node-name pos (+ pos target-len) target-str nil)))
-           nil)))}))
+       (when (starts-at? txt target-str pos)
+         (make-node node-name pos (+ pos target-len) target-str nil)))}))
 
 (defn Regex [opts]
   (let [node-name (:name opts)
@@ -159,8 +176,11 @@
     {:name node-name
      :parse
      (fn [^String txt pos]
-       (when-let [^String s (some #(when (.startsWith txt ^String % (int pos)) %) strs)]
-         (make-node node-name pos (+ pos (.length s)) s nil)))}))
+       (loop [strs strs]
+         (when-let [^String s (first strs)]
+           (if (starts-at? txt s pos)
+             (make-node node-name pos (+ pos (.length s)) s nil)
+             (recur (next strs))))))}))
 
 (defn SeqParser [opts]
   (let [node-name (:name opts)
@@ -228,23 +248,37 @@
 (def token-re-str (str "[^" token-head-chars whitespace-chars "][^" token-tail-chars whitespace-chars "]*"))
 (def char-re-str "\\\\[()\\[\\]{}\"@^;`, ]")
 
-(def whitespace-char-set (set whitespace-chars))
-
 ;; the char classes of token-re-str and char-re-str, unescaped
-(def token-head-excluded (into whitespace-char-set "()[]{}\"@~^;`#'"))
-(def token-tail-excluded (into whitespace-char-set "()[]{}\"@^;`"))
-(def char-literal-chars (set "()[]{}\"@^;`, "))
+(def token-head-excluded-chars (str whitespace-chars "()[]{}\"@~^;`#'"))
+(def token-tail-excluded-chars (str whitespace-chars "()[]{}\"@^;`"))
+(def char-literal-chars "()[]{}\"@^;`, ")
+
+(defn whitespace-char? [ch]
+  (char-in? ch whitespace-chars))
+
+(defn token-head-excluded? [ch]
+  (char-in? ch token-head-excluded-chars))
+
+(defn token-tail-excluded? [ch]
+  (char-in? ch token-tail-excluded-chars))
+
+(defn char-literal-char? [ch]
+  (char-in? ch char-literal-chars))
+
+;; the line terminators a regex . does not match
+(defn line-terminator? [ch]
+  (char-in? ch "\n\r\u0085\u2028\u2029"))
 
 (defn scan-whitespace [^String txt pos len]
   (loop [i pos]
-    (if (and (< i len) (contains? whitespace-char-set (.charAt txt i)))
+    (if (and (< i len) (whitespace-char? (.charAt txt i)))
       (recur (inc i))
       i)))
 
 (defn scan-comment [^String txt pos len]
-  (if (and (< pos len) (= (.charAt txt pos) \;))
+  (if (and (< pos len) (identical? (.charAt txt pos) \;))
     (loop [i (inc pos)]
-      (if (and (< i len) (not= (.charAt txt i) \newline))
+      (if (and (< i len) (not (identical? (.charAt txt i) \newline)))
         (recur (inc i))
         i))
     -1))
@@ -253,26 +287,39 @@
   (if (< pos len)
     (let [ch (.charAt txt pos)]
       (cond
-        (and (= ch \\) (< (inc pos) len) (contains? char-literal-chars (.charAt txt (inc pos))))
+        (and (identical? ch \\) (< (inc pos) len) (char-literal-char? (.charAt txt (inc pos))))
         (+ pos 2)
 
-        (contains? token-head-excluded ch)
+        (token-head-excluded? ch)
         -1
 
         :else
         (loop [i (inc pos)]
-          (if (and (< i len) (not (contains? token-tail-excluded (.charAt txt i))))
+          (if (and (< i len) (not (token-tail-excluded? (.charAt txt i))))
             (recur (inc i))
             i))))
     -1))
 
 ;; ^(##)?(char-re|token-re): the optional ## is only kept when a body follows it
 (defn scan-token [^String txt pos len]
-  (let [after-hashes (when (.startsWith txt "##" (int pos))
+  (let [after-hashes (when (starts-at? txt "##" pos)
                        (scan-token-body txt (+ pos 2) len))]
     (if (and after-hashes (>= after-hashes 0))
       after-hashes
       (scan-token-body txt pos len))))
+
+;; ^([^"\\]+|\\.)+ : its alternatives start with different chars, so the
+;; first match found is the regex's
+(defn scan-string-body [^String txt pos len]
+  (loop [i pos]
+    (if (< i len)
+      (case (.charAt txt i)
+        \" i
+        \\ (if (and (< (inc i) len) (not (line-terminator? (.charAt txt (inc i)))))
+             (recur (+ i 2))
+             i)
+        (recur (inc i)))
+      i)))
 
 (def parsers-registry (atom {}))
 
@@ -299,7 +346,7 @@
     (SeqParser
       {:name "string"
        :parsers [(Literals {:name ".open" :strs ["#\"" "\""]})
-                 (Optional (Regex {:name ".body" :regex #"^([^\"\\]+|\\.)+"}))
+                 (Optional (Scan {:name ".body" :scan scan-string-body}))
                  (Optional (Char {:name ".close" :char "\""}))]}))
 
   (register-parser! "token"
@@ -357,14 +404,11 @@
        (fn [^String txt pos]
          (if (< pos (.length txt))
            (let [ch (.charAt txt pos)]
-             (cond
-               (contains? whitespace-char-set ch)
-               (parse-ws txt pos)
-               (= ch \;)
-               (parse-comment txt pos)
-               (= ch \#)
-               (parse-discard txt pos)
-               :else nil))
+             (case ch
+               \; (parse-comment txt pos)
+               \# (parse-discard txt pos)
+               (when (whitespace-char? ch)
+                 (parse-ws txt pos))))
            nil))}))
 
   (register-parser! "meta"
@@ -402,23 +446,22 @@
         parse-string (parse-fn "string")
         parse-wrap (parse-fn "wrap")
         parse-meta (parse-fn "meta")
-        parse-token (parse-fn "token")]
+        parse-token (parse-fn "token")
+        parse-hash-form (:parse hash-form)]
     (register-parser! "_hashForm" hash-form)
     (register-parser! "_form"
       {:parse
        (fn [^String txt pos]
          (if (< pos (.length txt))
-           (let [ch (.charAt txt pos)]
-             (cond
-               (= ch \() (parse-parens txt pos)
-               (= ch \[) (parse-brackets txt pos)
-               (= ch \{) (parse-braces txt pos)
-               (= ch \") (parse-string txt pos)
-               (or (= ch \@) (= ch \') (= ch \`) (= ch \~))
-               (parse-wrap txt pos)
-               (= ch \^) (parse-meta txt pos)
-               (= ch \#) ((:parse hash-form) txt pos)
-               :else (parse-token txt pos)))
+           (case (.charAt txt pos)
+             \( (parse-parens txt pos)
+             \[ (parse-brackets txt pos)
+             \{ (parse-braces txt pos)
+             \" (parse-string txt pos)
+             (\@ \' \` \~) (parse-wrap txt pos)
+             \^ (parse-meta txt pos)
+             \# (parse-hash-form txt pos)
+             (parse-token txt pos))
            nil))}))
 
   (register-parser! "source"

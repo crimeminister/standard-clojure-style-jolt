@@ -1,7 +1,10 @@
 {:paths ["src"]
 
  :aliases
- {:test
+ {:bench
+  {:extra-paths ["bench"]}
+
+  :test
   {:extra-paths ["test"]
    :main-opts ["-m" "standard-clojure-style.parser-test"]}
 
