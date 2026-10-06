@@ -6,10 +6,12 @@ This document provides a comparative performance benchmark between **`standard-c
 
 ## 1. Test Environment & Methodology
 
-- **OS / Architecture:** Linux x86_64
-- **Jolt Dialect Version:** 0.8.17 (Chez Scheme backend; updated from 0.8.14, 0.8.13, 0.8.12, 0.8.11, 0.8.10, 0.8.9, 0.8.8, and 0.8.6)
-- **Node / V8 Environment:** Node.js invoked via `nix-shell -p pnpm --run "pnpx @chrisoakman/standard-clojure-style check ..."`
-- **Target Directories:** `src/`, `test/`, `test_cases/` (12 files total, including `.clj` source files and `.edn` test fixture suites)
+- **OS / Architecture:** Linux x86_64 for all runs through Jolt 0.8.17; macOS aarch64 (Apple M1 Max, 10 cores) for the Jolt 0.8.18 evaluation on branch `perf/formatter-throughput`
+- **Jolt Dialect Version:** 0.8.18 (Chez Scheme backend; updated from 0.8.17, 0.8.14, 0.8.13, 0.8.12, 0.8.11, 0.8.10, 0.8.9, 0.8.8, and 0.8.6)
+- **Node / V8 Environment:** Node.js v26.10.0 invoked via `pnpx @chrisoakman/standard-clojure-style check ...` (earlier Linux runs used `nix-shell -p pnpm --run "pnpx ..."`)
+- **Target Directories:** `src/`, `test/`, `test_cases/` (13 files total, including `.clj` source files and `.edn` test fixture suites; runs through Jolt 0.8.17 covered 12 files — `test/standard_clojure_style/parser_scan_test.clj` was added on `perf/formatter-throughput`)
+
+> **Cross-platform note:** numbers from Linux x86_64 and Apple M1 Max runs are not directly comparable; per-version trends are only meaningful within the same platform. Where the platform changed, both are recorded.
 
 ---
 
@@ -131,11 +133,92 @@ Following the implementation of the performance enhancement plan:
 3. **Continuation-Based Fast Escapes (`jolt.continuations`):** Employed `c/letcc [escape]` for zero-overhead escapes out of `Choice` parser loops.
 4. **Fiber-Backed Multi-Core CLI Concurrency (`jolt.fibers`):** Formatted files concurrently across all 20 CPU carrier threads while preserving deterministic sorted console output.
 5. **Clojure Transients for CST Flattening & Collection Accumulation:** Replaced atom-wrapped vectors, maps, and sets in high-frequency CST traversals and AST extraction loops with Clojure transient collections (`transient`, `conj!`, `assoc!`, `persistent!`). Specifically:
-   - **`flatten-tree`:** Traverses the CST directly into a transient vector instead of invoking `(swap! nodes conj %)` across tens of thousands of AST nodes. In microbenchmarks on `parse_ns.clj` (~26,000 nodes, 50 iterations), transient tree flattening required **48.0 ms** in Jolt 0.8.17 (47.0 ms in 0.8.14, 44.0 ms in 0.8.13, 49.0 ms in 0.8.12, 50.5 ms in 0.8.11, 52.7 ms in 0.8.10, 56.3 ms in 0.8.9) vs. **167.2 ms** with atoms (~3.5x speedup) with zero atom synchronization overhead.
+   - **`flatten-tree`:** Traverses the CST directly into a transient vector instead of invoking `(swap! nodes conj %)` across tens of thousands of AST nodes. In microbenchmarks on `parse_ns.clj` (~26,000 nodes, 50 iterations), transient tree flattening required **72.0 ms** in Jolt 0.8.18 on Apple M1 Max (48.0 ms in 0.8.17 on Linux x86_64, 47.0 ms in 0.8.14, 44.0 ms in 0.8.13, 49.0 ms in 0.8.12, 50.5 ms in 0.8.11, 52.7 ms in 0.8.10, 56.3 ms in 0.8.9) vs. **167.2 ms** with atoms (~2.3x speedup) with zero atom synchronization overhead.
    - **AST Metadata & Require Processing:** Utilized transient vectors and sets in `get-metadata-strings-from-meta-node`, `parse-gen-class-exposes`, `sort-ns-result`, `get-platforms-from-array`, `only-one-require-per-platform`, `format-renames-list`, and `get-refer-clojure-keys`.
    - **Avoiding Transient Overhead on Tiny Collections:** Benchmarking revealed that for loops that almost always yield 0 or 1 elements (such as newline paren-slurping look-ahead), Clojure's interned empty vector singleton `[]` is allocation-free and faster than instantiating a transient wrapper. Transients were therefore targeted specifically at bulk collection construction where their $O(1)$ amortized in-place mutation provides genuine speedups.
 
-### Updated Benchmark Comparison (Jolt 0.8.17)
+### Formatter Throughput Pass (Jolt 0.8.18, branch `perf/formatter-throughput`)
+
+A follow-up pass landed four more changes:
+
+6. **StringBuilder Output & Array-Backed Node State:** `format-nodes` builds its output in `StringBuilder`s and keeps per-node traversal state (`_printedColIdx`, `_origColIdx`, and friends) in flat mutable arrays instead of assoc'ing new maps onto CST nodes; each node's kind is computed once as a bitmask instead of asking the ns-parser predicates ~20 times per node.
+7. **Scanned Parser Terminals:** the parser's hot terminal combinators were rebuilt around a `Scan` primitive that advances over runs of matching characters in a tight loop. `Regex` now matches at the index with a region instead of copying a 2048-char chunk of the input before every attempt (which could also cut a string body's escape in half); tokens, whitespace, and comments are scanned by hand, and openers and reader markers are matched as literals (verified against the regex each replaces by `parser-scan-test`). Combinators resolve their child parsers once instead of looking them up by name per call, and `Choice` no longer captures a continuation.
+8. **Skipping `parse-ns` for Files With No `ns` Form:** with no `ns` token the ns-walk records nothing and can only reach the end or throw on an unbalanced closer, so a file with neither returns the empty result directly; the walk's state is held in volatiles rather than atoms.
+9. **Case-Dispatch Character Classification:** a `char-in?` macro expands character-set membership tests into `case` dispatches, char comparisons use `identical?` on primitives, and literal lookahead uses a direct `starts-at?` index loop.
+
+### Updated Benchmark Comparison (Jolt 0.8.18)
+
+```text
+$ ./standard-clj check src/ test/ test_cases/
+standard-clj check [0.29.0]
+
+✓ src/standard_clojure_style/cli.clj [41.0ms]
+✓ src/standard_clojure_style/core.clj [0.0ms]
+✓ src/standard_clojure_style/format.clj [51.0ms]
+✓ src/standard_clojure_style/main.clj [0.0ms]
+✓ src/standard_clojure_style/parse_ns.clj [55.0ms]
+✓ src/standard_clojure_style/parser.clj [19.0ms]
+✓ test/standard_clojure_style/format_test.clj [2.0ms]
+✓ test/standard_clojure_style/parse_ns_test.clj [2.0ms]
+✓ test/standard_clojure_style/parser_scan_test.clj [5.0ms]
+✓ test/standard_clojure_style/parser_test.clj [2.0ms]
+✓ test_cases/format_tests.edn [29.0ms]
+✓ test_cases/parse_ns_tests.edn [36.0ms]
+✓ test_cases/parser_tests.edn [17.0ms]
+
+All 13 files formatted with Standard Clojure Style 👍 [56.0ms]
+```
+
+On the same machine, the JavaScript reference implementation completed the identical 13 files in **80.31 ms** — the native binary is now faster than the JS implementation on identical hardware:
+
+```text
+$ pnpx @chrisoakman/standard-clojure-style check src/ test/ test_cases/
+standard-clj check v0.29.0
+
+✓ /src/standard_clojure_style/cli.clj [12.15ms]
+✓ /src/standard_clojure_style/core.clj [1.16ms]
+✓ /src/standard_clojure_style/format.clj [14.77ms]
+✓ /src/standard_clojure_style/main.clj [0.57ms]
+✓ /src/standard_clojure_style/parse_ns.clj [21.27ms]
+✓ /src/standard_clojure_style/parser.clj [3.45ms]
+✓ /test/standard_clojure_style/format_test.clj [0.84ms]
+✓ /test/standard_clojure_style/parse_ns_test.clj [0.75ms]
+✓ /test/standard_clojure_style/parser_scan_test.clj [1.04ms]
+✓ /test/standard_clojure_style/parser_test.clj [0.85ms]
+✓ /test_cases/format_tests.edn [8.34ms]
+✓ /test_cases/parse_ns_tests.edn [5.93ms]
+✓ /test_cases/parser_tests.edn [2.3ms]
+
+All 13 files formatted with Standard Clojure Style 👍 [80.31ms]
+```
+
+### Comparative Summary
+
+| Metric | Initial `standard-clj` (v0.8.6 Baseline) | Post-Optimization `standard-clj` (v0.8.6) | Historical `standard-clj` (v0.8.8) | Historical `standard-clj` (v0.8.9) | Historical `standard-clj` (v0.8.10) | Historical `standard-clj` (v0.8.11) | Historical `standard-clj` (v0.8.12) | Historical `standard-clj` (v0.8.13) | Historical `standard-clj` (v0.8.14) | Historical `standard-clj` (v0.8.17) | Fresh Evaluation `standard-clj` (v0.8.18, M1 Max) | `standard-clojure-style-js` | Overall Improvement (vs Baseline) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `parse_ns.clj` parse time | 591 ms | 101 ms | 95 ms | 41 ms | 37 ms | 33 ms | 32 ms | 35 ms | 36 ms | 36 ms | **12 ms** | ~3 ms | **49.3x faster parse** |
+| `parse_ns.clj` tree flatten (50 runs) | ~170 ms | ~170 ms | ~170 ms | 56.3 ms | 52.7 ms | 50.5 ms | 49.0 ms | 44.0 ms | 47.0 ms | 48.0 ms | **72.0 ms** | N/A | **2.3x faster flatten** |
+| `parse_ns.clj` format time | 11,849 ms | 405 ms | 388 ms | 215 ms | 209 ms | 203 ms | 196 ms | 202 ms | 212 ms | 212 ms | **55 ms** | 15.9 ms | **215.4x faster format** |
+| **Total CLI Runtime** | **22,113 ms (~22.1s)** | **407 ms (~0.41s)** | **389 ms (~0.39s)** | **216 ms (~0.22s)** | **210 ms (~0.21s)** | **204 ms (~0.20s)** | **197 ms (~0.20s)** | **226 ms (~0.23s)** | **228 ms (~0.23s)** | **232 ms (~0.23s)** | **56.0 ms (~0.06s)** (13 files) | **69.9 ms (~0.07s)** | **394.9x overall speedup** |
+
+The v0.8.18 column was measured on Apple M1 Max with 13 target files; all earlier Jolt columns were Linux x86_64 with 12 files. On identical M1 Max hardware the JS implementation needed 80.31 ms for the same 13 files, so the native binary is now faster than the JS reference in a same-machine comparison.
+
+### Evaluation of `jolt.parser` Alternative
+
+Testing Jolt's built-in `jolt.parser` (`jolt.parser.combinators`, `jolt.parser.basic`) revealed that it is a monadic parser framework (Parsec-style) that tracks input coordinates by constructing `#jolt.parser.position.Location` records for every character token. 
+- In Jolt 0.8.18 (as with 0.8.17, 0.8.14, and 0.8.13), deeply nested monadic combinator chains without memoization or tail recursion (such as `(pc/many pb/any)`) exhibit quadratic $O(N^2)$ scaling on long inputs: parsing 1,000 characters took 123 ms, 4,000 characters took 2,672 ms, and 8,000 characters required 9,928 ms on Apple M1 Max (median of 3 runs; projecting to roughly 17 minutes on the 81,100 characters of `parse_ns.clj`, compared to 11,839 ms in 0.8.17 on Linux x86_64, 12,932 ms in 0.8.14, 13,203 ms in 0.8.13, 722 ms in 0.8.12, 565 ms in 0.8.11, 601 ms in 0.8.10, 615 ms in 0.8.9, 646 ms in 0.8.8, and 653 ms in 0.8.6).
+- In contrast, our index-based CST parser parses the complete CST grammar of `parse_ns.clj` in **12 ms** on Apple M1 Max (compared to 36 ms in 0.8.17 on Linux x86_64, 36 ms in 0.8.14, 35 ms in 0.8.13, 32 ms in 0.8.12, 33 ms in 0.8.11, 37 ms in 0.8.10, 41 ms in 0.8.9, 95 ms in 0.8.8, and 101 ms in 0.8.6).
+- **Conclusion:** Retaining the custom, zero-allocation index-based CST parser provides superior performance and preserves 100% CST schema fidelity with upstream tests.
+
+---
+
+## Appendix: Historical Results
+
+For historical tracking and comparison, post-optimization benchmark results gathered under previous Jolt versions are preserved below.
+
+### Historical Results (Jolt 0.8.17)
+
+#### CLI Output (Jolt 0.8.17)
 
 ```text
 $ ./standard-clj check src/ test/ test_cases/
@@ -157,27 +240,13 @@ standard-clj check [0.29.0]
 All 12 files formatted with Standard Clojure Style 👍 [232.0ms]
 ```
 
-### Comparative Summary
+#### Metrics Recorded Under Jolt 0.8.17
 
-| Metric | Initial `standard-clj` (v0.8.6 Baseline) | Post-Optimization `standard-clj` (v0.8.6) | Historical `standard-clj` (v0.8.8) | Historical `standard-clj` (v0.8.9) | Historical `standard-clj` (v0.8.10) | Historical `standard-clj` (v0.8.11) | Historical `standard-clj` (v0.8.12) | Historical `standard-clj` (v0.8.13) | Historical `standard-clj` (v0.8.14) | Fresh Evaluation `standard-clj` (v0.8.17) | `standard-clojure-style-js` | Overall Improvement (vs Baseline) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `parse_ns.clj` parse time | 591 ms | 101 ms | 95 ms | 41 ms | 37 ms | 33 ms | 32 ms | 35 ms | 36 ms | **36 ms** | ~3 ms | **16.4x faster parse** |
-| `parse_ns.clj` tree flatten (50 runs) | ~170 ms | ~170 ms | ~170 ms | 56.3 ms | 52.7 ms | 50.5 ms | 49.0 ms | 44.0 ms | 47.0 ms | **48.0 ms** | N/A | **3.5x faster flatten** |
-| `parse_ns.clj` format time | 11,849 ms | 405 ms | 388 ms | 215 ms | 209 ms | 203 ms | 196 ms | 202 ms | 212 ms | **212 ms** | 15.9 ms | **55.9x faster format** |
-| **Total CLI Runtime (12 files)** | **22,113 ms (~22.1s)** | **407 ms (~0.41s)** | **389 ms (~0.39s)** | **216 ms (~0.22s)** | **210 ms (~0.21s)** | **204 ms (~0.20s)** | **197 ms (~0.20s)** | **226 ms (~0.23s)** | **228 ms (~0.23s)** | **232 ms (~0.23s)** | **69.9 ms (~0.07s)** | **95.3x overall speedup** |
-
-### Evaluation of `jolt.parser` Alternative
-
-Testing Jolt's built-in `jolt.parser` (`jolt.parser.combinators`, `jolt.parser.basic`) revealed that it is a monadic parser framework (Parsec-style) that tracks input coordinates by constructing `#jolt.parser.position.Location` records for every character token. 
-- In Jolt 0.8.17 (as with 0.8.14 and 0.8.13), deeply nested monadic combinator chains without memoization or tail recursion (such as `(pc/many pb/any)`) exhibit quadratic $O(N^2)$ scaling on long inputs: parsing 1,000 characters took 120 ms, 4,000 characters took 2,682 ms, and 8,000 characters required 11,839 ms (projecting to >20 minutes on the 78,100 characters of `parse_ns.clj`, compared to 12,932 ms in 0.8.14, 13,203 ms in 0.8.13, 722 ms in 0.8.12, 565 ms in 0.8.11, 601 ms in 0.8.10, 615 ms in 0.8.9, 646 ms in 0.8.8, and 653 ms in 0.8.6).
-- In contrast, our index-based CST parser parses the complete CST grammar of `parse_ns.clj` in **36 ms** (compared to 36 ms in 0.8.14, 35 ms in 0.8.13, 32 ms in 0.8.12, 33 ms in 0.8.11, 37 ms in 0.8.10, 41 ms in 0.8.9, 95 ms in 0.8.8, and 101 ms in 0.8.6).
-- **Conclusion:** Retaining the custom, zero-allocation index-based CST parser provides superior performance and preserves 100% CST schema fidelity with upstream tests.
-
----
-
-## Appendix: Historical Results
-
-For historical tracking and comparison, post-optimization benchmark results gathered under previous Jolt versions are preserved below.
+- **`parse_ns.clj` Parse Time:** 36 ms
+- **`parse_ns.clj` Tree Flatten (50 runs):** 48.0 ms
+- **`parse_ns.clj` Format Time:** 212.0 ms
+- **Total CLI Runtime (12 files):** 232.0 ms
+- **`jolt.parser` Combinator `(pc/many pb/any)`:** 11,839 ms (8,000 chars)
 
 ### Historical Results (Jolt 0.8.14)
 
