@@ -1,7 +1,10 @@
 {:paths ["src"]
 
  :aliases
- {:test
+ {:bench
+  {:extra-paths ["bench"]}
+
+  :test
   {:extra-paths ["test"]
    :main-opts ["-m" "standard-clojure-style.parser-test"]}
 
@@ -31,4 +34,4 @@
   "mkdir -p target/release && jolt build -m standard-clojure-style.main -A:build-release --opt --closed-world --direct-link -o target/release/standard-clj"
 
   test
-  "jolt -A:test -m standard-clojure-style.parser-test && jolt -A:test -m standard-clojure-style.parse-ns-test && jolt -A:test -m standard-clojure-style.format-test"}}
+  "jolt -A:test -m standard-clojure-style.parser-test && jolt -A:test -m standard-clojure-style.parser-scan-test && jolt -A:test -m standard-clojure-style.parse-ns-test && jolt -A:test -m standard-clojure-style.format-test"}}

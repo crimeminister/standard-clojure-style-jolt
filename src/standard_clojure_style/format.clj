@@ -23,18 +23,21 @@
 (defn is-string-with-chars [s]
   (and (string? s) (not= s "")))
 
-(defn str-has-non-whitespace-chars [^String s]
-  (and (string? s) (not= (str/trim s) "")))
+(defn sb-has-non-whitespace-chars [^StringBuilder sb]
+  (let [n (.length sb)]
+    (loop [i 0]
+      (and (< i n)
+           (or (not (Character/isWhitespace (.charAt sb i)))
+               (recur (inc i)))))))
 
 (defn is-space-or-comma [ch]
   (or (= ch \space) (= ch \,)))
 
-(defn remove-trailing-whitespace [^String txt]
-  (let [len (count txt)]
-    (loop [end-idx len]
-      (if (and (> end-idx 0) (is-space-or-comma (.charAt txt (dec end-idx))))
-        (recur (dec end-idx))
-        (subs txt 0 end-idx)))))
+(defn remove-trailing-whitespace! [^StringBuilder sb]
+  (loop [end-idx (.length sb)]
+    (if (and (> end-idx 0) (is-space-or-comma (.charAt sb (dec end-idx))))
+      (recur (dec end-idx))
+      (.setLength sb end-idx))))
 
 (defn remove-leading-whitespace [^String txt]
   (str/trimr (str/replace-first txt #"^[, ]*\n+ *" "")))
@@ -49,12 +52,6 @@
     (if-not last-nl
       false
       (boolean (str/index-of s "," last-nl)))))
-
-(defn has-commas-after-newline [node]
-  (and (ns-parser/is-whitespace-node node) (txt-has-commas-after-newline (:text node))))
-
-(defn is-newline-node-with-comma-on-next-line [node]
-  (and (ns-parser/is-newline-node node) (txt-has-commas-after-newline (:text node))))
 
 ;; -----------------------------------------------------------------------------
 ;; Namespace Formatter Helpers
@@ -732,429 +729,483 @@
 ;; -----------------------------------------------------------------------------
 ;; formatNodes & format
 
+;; Node kinds, as bits. The format loop asks the same few questions of every
+;; node many times over; node-kind answers them once per node (and again when
+;; the loop rewrites a node's text), and kind? tests one bit.
+
+(defmacro ^:private kind-bit [k]
+  (case k
+    :whitespace 1
+    :newline 2
+    :comment 4
+    :token 8
+    :tag 16
+    :paren-opener 32
+    :paren-closer 64
+    :text 128
+    :non-blank-text 256
+    :commas-after-newline 512
+    :newline-with-comma 1024
+    :comma 2048
+    :ns 4096
+    :ignore-keyword 8192))
+
+(defmacro ^:private kind? [kinds i k]
+  `(not (zero? (bit-and (aget ~kinds ~i) (kind-bit ~k)))))
+
+;; node-kind answers what the ns-parser predicates would, but reads the node's
+;; :name and :text once: asked through the predicates, each question re-reads
+;; them, and the predicates re-ask each other.
+(defn node-kind [m]
+  (let [txt (:text m)
+        has-text (and (string? txt) (not= txt ""))
+        k (if has-text
+            (cond-> (kind-bit :text)
+              (not (identical? (.charAt ^String txt 0) \space)) (bit-or (kind-bit :non-blank-text)))
+            0)]
+    (case (:name m)
+      "whitespace"
+      (if (string? txt)
+        (cond-> (bit-or k (kind-bit :whitespace))
+          (str/includes? txt "\n") (bit-or (kind-bit :newline))
+          ;; only a newline can have commas after it
+          (txt-has-commas-after-newline txt) (bit-or (kind-bit :commas-after-newline)
+                                                     (kind-bit :newline-with-comma))
+          (str/includes? txt ",") (bit-or (kind-bit :comma)))
+        (bit-or k (kind-bit :whitespace)))
+
+      "comment" (bit-or k (kind-bit :comment))
+
+      "token"
+      (case txt
+        "ns" (bit-or k (kind-bit :token) (kind-bit :ns))
+        ":standard-clj/ignore" (bit-or k (kind-bit :token) (kind-bit :ignore-keyword))
+        (bit-or k (kind-bit :token)))
+
+      ".tag" (bit-or k (kind-bit :tag))
+
+      ".open"
+      (cond-> k
+        (ns-parser/is-paren-opener m) (bit-or (kind-bit :paren-opener)))
+
+      ".close"
+      (case txt
+        (")" "]" "}") (bit-or k (kind-bit :paren-closer))
+        k)
+
+      k)))
+
 (defn format-nodes [nodes-arr parsed-ns]
   (let [num-nodes (count nodes-arr)
         has-parsed-ns-form (not (nil? (get parsed-ns "nsSymbol")))
-        ;; wrap each node in an atom so mutable properties can be tracked
-        nodes (mapv atom nodes-arr)
 
-        paren-nesting-depth (atom 0)
-        idx (atom 0)
-        out-txt (atom "")
-        output-txt-contains-chars (atom false)
-        line-txt (atom "")
-        line-idx (atom 0)
-        inside-ns-form (atom false)
-        line-idx-of-closing-ns-form (atom -1)
-        ns-start-string-idx (atom -1)
-        ns-end-string-idx (atom -1)
-        ignore-nodes-start-id (atom -1)
-        ignore-nodes-end-id (atom -1)
-        inside-the-ignore-zone (atom false)
+        ;; Per-node state, indexed by node position. `nodes` holds each node's
+        ;; current map: formatting rewrites some nodes' :text, and the
+        ;; ns-parser predicates read it. The bookkeeping upstream keeps on the
+        ;; node objects themselves lives in the arrays beside it.
+        ^objects nodes (object-array nodes-arr)
+        ^longs kinds (let [a (long-array num-nodes)]
+                       (dotimes [i num-nodes]
+                         (aset a i (long (node-kind (aget nodes i)))))
+                       a)
+        ^longs orig-col-idx (long-array num-nodes -1)
+        ^longs printed-col-idx (long-array num-nodes -1)
+        ^objects was-slurped-up (object-array num-nodes)
+        ;; paren openers only
+        ^longs paren-opener-line-idx (long-array num-nodes -1)
+        ^objects opening-line-nodes (object-array num-nodes)
+        ;; filled in on first use: most openers never start a line inside them
+        ^objects next-with-text-skipping-meta (object-array num-nodes)
+        ^objects rule3-active (object-array num-nodes)
+        ^longs rule3-num-spaces (long-array num-nodes)
+        ^objects rule3-search-complete (object-array num-nodes)
 
-        paren-stack (atom [])
-        nodes-we-have-printed-on-this-line (atom [])
-        col-idx (atom 0)]
+        paren-nesting-depth (volatile! 0)
+        idx (volatile! 0)
+        out-sb (StringBuilder.)
+        output-txt-contains-chars (volatile! false)
+        line-sb (StringBuilder.)
+        line-idx (volatile! 0)
+        inside-ns-form (volatile! false)
+        line-idx-of-closing-ns-form (volatile! -1)
+        ns-start-string-idx (volatile! -1)
+        ns-end-string-idx (volatile! -1)
+        ignore-nodes-start-id (volatile! -1)
+        ignore-nodes-end-id (volatile! -1)
+        inside-the-ignore-zone (volatile! false)
 
-    (letfn [(find-next-text-node [i]
-              (let [n num-nodes]
-                (loop [j i]
-                  (when (< j n)
-                    (let [node (nth nodes j)]
-                      (if (and (string? (:text @node)) (not= (:text @node) ""))
-                        node
-                        (recur (inc j))))))))
+        paren-stack (volatile! [])
+        nodes-we-have-printed-on-this-line (volatile! [])]
 
-            (find-next-text-node-skipping-meta-atom [i]
-              (ns-parser/find-next-text-node-skipping-meta nodes-arr i))]
+    (letfn [(node-at [i] (aget nodes i))
+
+            (next-text-skipping-meta [opener-i]
+              (let [cached (aget next-with-text-skipping-meta opener-i)]
+                (if (some? cached)
+                  (when-not (identical? cached ::none) cached)
+                  (let [found (ns-parser/find-next-text-node-skipping-meta nodes-arr (inc opener-i))]
+                    (aset next-with-text-skipping-meta opener-i (if (some? found) found ::none))
+                    found))))
+
+            (set-text! [i txt]
+              (let [m (assoc (aget nodes i) :text txt)]
+                (aset nodes i m)
+                (aset kinds i (node-kind m))))
+
+            (find-next-text-node [i]
+              (loop [j i]
+                (when (< j num-nodes)
+                  (let [txt (:text (aget nodes j))]
+                    (if (and (string? txt) (not= txt ""))
+                      j
+                      (recur (inc j)))))))
+
+            ;; record original col indexes for the line that starts at start-i
+            (record-orig-col-idxs! [start-i initial-spaces]
+              (loop [i start-i
+                     col initial-spaces]
+                (when (< i num-nodes)
+                  (let [nd-m (aget nodes i)]
+                    (when-not (kind? kinds i :newline)
+                      (let [txt (:text nd-m)]
+                        (cond
+                          (and (string? txt) (not= txt ""))
+                          (do
+                            (aset orig-col-idx i (long col))
+                            (recur (inc i) (+ col (count txt))))
+
+                          (kind? kinds i :tag)
+                          (do
+                            (aset orig-col-idx i (long col))
+                            (recur (inc i) (inc col)))
+
+                          :else
+                          (recur (inc i) col))))))))]
 
       (while (< @idx num-nodes)
-        (let [node (nth nodes @idx)]
-          (when (ns-parser/is-tag-node @node)
-            (swap! node assoc :text "#"))
-          (let [m @node]
+        (let [i @idx]
+          (when (kind? kinds i :tag)
+            (set-text! i "#"))
+          (let [m (node-at i)]
             (when (and (> @ignore-nodes-start-id 0) (= (:id m) @ignore-nodes-start-id))
-              (reset! inside-the-ignore-zone true)
-              (swap! out-txt str @line-txt)
-              (reset! line-txt ""))
+              (vreset! inside-the-ignore-zone true)
+              (.append out-sb line-sb)
+              (.setLength line-sb 0))
 
             (if @inside-the-ignore-zone
               (do
                 (when (and (string? (:text m)) (not= (:text m) ""))
-                  (swap! out-txt str (:text m)))
+                  (.append out-sb ^String (:text m)))
                 (when (= (:id m) @ignore-nodes-end-id)
-                  (reset! ignore-nodes-start-id -1)
-                  (reset! ignore-nodes-end-id -1)
-                  (reset! inside-the-ignore-zone false)))
+                  (vreset! ignore-nodes-start-id -1)
+                  (vreset! ignore-nodes-end-id -1)
+                  (vreset! inside-the-ignore-zone false)))
 
               (do
-                (when (= @idx 0)
-                  (let [first-m @(first nodes)
-                        initial-spaces (if (ns-parser/is-newline-node first-m)
-                                         (num-spaces-after-newline first-m)
-                                         0)
-                        start-i (if (ns-parser/is-newline-node first-m) 1 0)]
-                    (loop [i start-i
-                           col initial-spaces]
-                      (when (< i num-nodes)
-                        (let [nd (nth nodes i)
-                              nd-m @nd]
-                          (when-not (ns-parser/is-newline-node nd-m)
-                            (let [txt (:text nd-m)]
-                              (cond
-                                (and (string? txt) (not= txt ""))
-                                (do
-                                  (swap! nd assoc :_origColIdx col)
-                                  (recur (inc i) (+ col (count txt))))
-
-                                (ns-parser/is-tag-node nd-m)
-                                (do
-                                  (swap! nd assoc :_origColIdx col)
-                                  (recur (inc i) (inc col)))
-
-                                :else
-                                (recur (inc i) col)))))))))
+                (when (= i 0)
+                  (let [first-m (node-at 0)]
+                    (if (kind? kinds 0 :newline)
+                      (record-orig-col-idxs! 1 (num-spaces-after-newline first-m))
+                      (record-orig-col-idxs! 0 0))))
 
                 (when (and (= @ns-start-string-idx -1) (= @paren-nesting-depth 1)
-                           has-parsed-ns-form (ns-parser/is-ns-node m))
-                  (reset! inside-ns-form true)
-                  (reset! ns-start-string-idx (count (str @out-txt @line-txt))))
+                           has-parsed-ns-form (kind? kinds i :ns))
+                  (vreset! inside-ns-form true)
+                  (vreset! ns-start-string-idx (+ (.length out-sb) (.length line-sb))))
 
-                (let [next-text-node (find-next-text-node (inc @idx))
-                      is-last-node (>= (inc @idx) num-nodes)
-                      current-node-is-whitespace (ns-parser/is-whitespace-node m)
-                      current-node-is-newline (ns-parser/is-newline-node m)
-                      skip-printing-this-node (atom false)]
+                (let [next-text-idx (find-next-text-node (inc i))
+                      is-last-node (>= (inc i) num-nodes)
+                      current-node-is-whitespace (kind? kinds i :whitespace)
+                      current-node-is-newline (kind? kinds i :newline)
+                      skip-printing-this-node (volatile! false)]
 
                   ;; :standard-clj/ignore check
-                  (when (and (ns-parser/is-standard-clj-ignore-keyword m) (> @idx 1))
+                  (when (and (kind? kinds i :ignore-keyword) (> i 1))
                     (let [deref-nodes nodes-arr
-                          prev-node1 (ns-parser/find-prev-node-with-text deref-nodes @idx (:id m))
-                          prev-node2 (when prev-node1 (ns-parser/find-prev-node-with-text deref-nodes @idx (:id prev-node1)))
+                          prev-node1 (ns-parser/find-prev-node-with-text deref-nodes i (:id m))
+                          prev-node2 (when prev-node1 (ns-parser/find-prev-node-with-text deref-nodes i (:id prev-node1)))
                           is-discard-map (and prev-node1 (= (:name prev-node1) ".open") (= (:text prev-node1) "{")
                                               prev-node2 (ns-parser/is-discard-node prev-node2))]
                       (cond
                         (or (ns-parser/is-discard-node prev-node1)
                             (and (ns-parser/is-whitespace-node prev-node1) (ns-parser/is-discard-node prev-node2)))
-                        (let [next-ignore-node (ns-parser/find-next-non-whitespace-node deref-nodes (inc @idx))]
+                        (let [next-ignore-node (ns-parser/find-next-non-whitespace-node deref-nodes (inc i))]
                           (if (and (vector? (:children next-ignore-node)) (seq (:children next-ignore-node)))
                             (let [closing-node (last (:children next-ignore-node))]
-                              (reset! ignore-nodes-start-id (:id next-ignore-node))
-                              (reset! ignore-nodes-end-id (:id closing-node)))
-                            (let [next-immediate-node (nth deref-nodes (inc @idx))]
-                              (reset! ignore-nodes-start-id (:id next-immediate-node))
-                              (reset! ignore-nodes-end-id (:id next-ignore-node)))))
+                              (vreset! ignore-nodes-start-id (:id next-ignore-node))
+                              (vreset! ignore-nodes-end-id (:id closing-node)))
+                            (let [next-immediate-node (nth deref-nodes (inc i))]
+                              (vreset! ignore-nodes-start-id (:id next-immediate-node))
+                              (vreset! ignore-nodes-end-id (:id next-ignore-node)))))
 
                         is-discard-map
-                        (let [opening-brace-node (ns-parser/find-prev-node-with-predicate deref-nodes @idx ns-parser/is-opening-brace-node)
+                        (let [opening-brace-node (ns-parser/find-prev-node-with-predicate deref-nodes i ns-parser/is-opening-brace-node)
                               closing-brace-node-id (:id (nth (:children opening-brace-node) 2))
-                              start-ignore-node (ns-parser/find-next-node-with-predicate-after-specific-node deref-nodes @idx (constantly true) closing-brace-node-id)
-                              first-node-inside (ns-parser/find-next-node-with-predicate-after-specific-node deref-nodes @idx (constantly true) (:id start-ignore-node))]
+                              start-ignore-node (ns-parser/find-next-node-with-predicate-after-specific-node deref-nodes i (constantly true) closing-brace-node-id)
+                              first-node-inside (ns-parser/find-next-node-with-predicate-after-specific-node deref-nodes i (constantly true) (:id start-ignore-node))]
                           (if (and (vector? (:children first-node-inside)) (seq (:children first-node-inside)))
                             (let [closing-node (last (:children first-node-inside))]
-                              (reset! ignore-nodes-start-id (:id start-ignore-node))
-                              (reset! ignore-nodes-end-id (:id closing-node)))
+                              (vreset! ignore-nodes-start-id (:id start-ignore-node))
+                              (vreset! ignore-nodes-end-id (:id closing-node)))
                             (do
-                              (reset! ignore-nodes-start-id (:id start-ignore-node))
-                              (reset! ignore-nodes-end-id (:id first-node-inside))))))))
+                              (vreset! ignore-nodes-start-id (:id start-ignore-node))
+                              (vreset! ignore-nodes-end-id (:id first-node-inside))))))))
 
                   (cond
-                    (ns-parser/is-paren-opener m)
+                    (kind? kinds i :paren-opener)
                     (do
                       (when-let [top (peek @paren-stack)]
-                        (when (= @line-idx (:_parenOpenerLineIdx @top))
-                          (swap! node assoc :_colIdx @col-idx :_lineIdx @line-idx)
-                          (swap! top update :_openingLineNodes conj node)))
+                        (when (= @line-idx (aget paren-opener-line-idx top))
+                          (aset opening-line-nodes top (conj (aget opening-line-nodes top) i))))
 
-                      (swap! paren-nesting-depth inc)
+                      (vswap! paren-nesting-depth inc)
 
-                      (swap! node assoc
-                             :_colIdx @col-idx
-                             :_nextWithText (when next-text-node @next-text-node)
-                             :_nextWithTextSkippingMeta (find-next-text-node-skipping-meta-atom (inc @idx))
-                             :_parenOpenerLineIdx @line-idx
-                             :_openingLineNodes []
-                             :_rule3Active false
-                             :_rule3NumSpaces 0
-                             :_rule3SearchComplete false)
-                      (swap! paren-stack conj node)
+                      (aset paren-opener-line-idx i (long @line-idx))
+                      (aset opening-line-nodes i [])
+                      (aset rule3-active i false)
+                      (aset rule3-num-spaces i 0)
+                      (aset rule3-search-complete i false)
+                      (vswap! paren-stack conj i)
 
-                      (when (and next-text-node (ns-parser/is-whitespace-node @next-text-node))
-                        (swap! next-text-node assoc :text "")))
+                      (when (and next-text-idx (kind? kinds next-text-idx :whitespace))
+                        (set-text! next-text-idx "")))
 
-                    (ns-parser/is-paren-closer m)
+                    (kind? kinds i :paren-closer)
                     (do
-                      (swap! paren-nesting-depth dec)
-                      (swap! paren-stack pop)
+                      (vswap! paren-nesting-depth dec)
+                      (vswap! paren-stack pop)
                       (when (and @inside-ns-form (= @paren-nesting-depth 0))
-                        (reset! inside-ns-form false)
-                        (reset! ns-end-string-idx (count (str @out-txt @line-txt)))
-                        (reset! line-idx-of-closing-ns-form @line-idx))))
+                        (vreset! inside-ns-form false)
+                        (vreset! ns-end-string-idx (+ (.length out-sb) (.length line-sb)))
+                        (vreset! line-idx-of-closing-ns-form @line-idx))))
 
                   (when-let [top (peek @paren-stack)]
-                    (when (ns-parser/node-contains-text m)
-                      (when (= @line-idx (:_parenOpenerLineIdx @top))
-                        (swap! node assoc :_colIdx @col-idx :_lineIdx @line-idx)
-                        (swap! top update :_openingLineNodes conj node))))
+                    (when (kind? kinds i :text)
+                      (when (= @line-idx (aget paren-opener-line-idx top))
+                        (aset opening-line-nodes top (conj (aget opening-line-nodes top) i)))))
 
                   (when (and current-node-is-whitespace (not current-node-is-newline)
-                             next-text-node (ns-parser/is-paren-closer @next-text-node))
-                    (reset! skip-printing-this-node true))
+                             next-text-idx (kind? kinds next-text-idx :paren-closer))
+                    (vreset! skip-printing-this-node true))
 
                   (when (and current-node-is-whitespace (not current-node-is-newline)
-                             next-text-node (ns-parser/is-comment-node @next-text-node))
-                    (swap! node update :text str/replace "," ""))
+                             next-text-idx (kind? kinds next-text-idx :comment))
+                    (set-text! i (str/replace (:text (node-at i)) "," "")))
 
                   ;; Look forward to slurp closing parens
                   (when (and (seq @paren-stack) (not @inside-ns-form))
-                    (let [is-comment-followed-by-nl (and (ns-parser/is-comment-node m) next-text-node (ns-parser/is-newline-node @next-text-node))
-                          has-commas-after-nl (or (has-commas-after-newline m) (and next-text-node (has-commas-after-newline @next-text-node)))
+                    (let [is-comment-followed-by-nl (and (kind? kinds i :comment) next-text-idx (kind? kinds next-text-idx :newline))
+                          has-commas-after-nl (or (kind? kinds i :commas-after-newline)
+                                                  (and next-text-idx (kind? kinds next-text-idx :commas-after-newline)))
                           look-forward (cond
                                          has-commas-after-nl false
                                          is-comment-followed-by-nl true
                                          current-node-is-newline true
                                          :else false)]
                       (when look-forward
-                        (let [closers (loop [i (inc @idx)
+                        (let [closers (loop [j (inc i)
                                              acc []]
-                                        (if (>= i num-nodes)
+                                        (if (>= j num-nodes)
                                           acc
-                                          (let [nd (nth nodes i)
-                                                nd-m @nd]
-                                            (cond
-                                              (is-newline-node-with-comma-on-next-line nd-m) acc
-                                              (or (ns-parser/is-whitespace-node nd-m)
-                                                  (ns-parser/is-paren-closer nd-m)
-                                                  (ns-parser/is-comment-node nd-m))
-                                              (recur (inc i) (conj acc nd))
-                                              :else acc))))
-                              last-node-printed (last @nodes-we-have-printed-on-this-line)
-                              last-m (when last-node-printed @last-node-printed)
-                              trimmed? (atom false)]
-                          (when (and last-m (ns-parser/is-whitespace-node last-m))
-                            (reset! line-txt (remove-trailing-whitespace @line-txt))
-                            (reset! trimmed? true))
+                                          (cond
+                                            (kind? kinds j :newline-with-comma) acc
+                                            (or (kind? kinds j :whitespace)
+                                                (kind? kinds j :paren-closer)
+                                                (kind? kinds j :comment))
+                                            (recur (inc j) (conj acc j))
+                                            :else acc)))
+                              last-node-printed (peek @nodes-we-have-printed-on-this-line)
+                              last-m (when last-node-printed (node-at last-node-printed))
+                              trimmed? (and last-node-printed (kind? kinds last-node-printed :whitespace))]
+                          (when trimmed?
+                            (remove-trailing-whitespace! line-sb))
 
-                          (doseq [closer-nd closers]
-                            (let [c-m @closer-nd]
-                              (when (ns-parser/is-paren-closer c-m)
-                                (swap! line-txt str (:text c-m))
-                                (swap! closer-nd assoc :text "" :_wasSlurpedUp true)
-                                (swap! paren-nesting-depth dec)
-                                (swap! paren-stack pop))))
+                          (doseq [closer-idx closers]
+                            (let [c-m (node-at closer-idx)]
+                              (when (kind? kinds closer-idx :paren-closer)
+                                (.append line-sb ^String (:text c-m))
+                                (set-text! closer-idx "")
+                                (aset was-slurped-up closer-idx true)
+                                (vswap! paren-nesting-depth dec)
+                                (vswap! paren-stack pop))))
 
-                          (when @trimmed?
-                            (swap! line-txt str (:text last-m)))))))
+                          (when trimmed?
+                            (.append line-sb ^String (:text last-m)))))))
 
                   (when current-node-is-newline
-                    ;; Record original col indexes for the next line
-                    (let [initial-spaces (num-spaces-after-newline m)
-                          start-i (inc @idx)]
-                      (loop [i start-i
-                             col initial-spaces]
-                        (when (< i num-nodes)
-                          (let [nd (nth nodes i)
-                                nd-m @nd]
-                            (when-not (ns-parser/is-newline-node nd-m)
-                              (let [txt (:text nd-m)]
-                                (cond
-                                  (and (string? txt) (not= txt ""))
-                                  (do
-                                    (swap! nd assoc :_origColIdx col)
-                                    (recur (inc i) (+ col (count txt))))
-
-                                  (ns-parser/is-tag-node nd-m)
-                                  (do
-                                    (swap! nd assoc :_origColIdx col)
-                                    (recur (inc i) (inc col)))
-
-                                  :else
-                                  (recur (inc i) col))))))))
+                    (record-orig-col-idxs! (inc i) (num-spaces-after-newline m))
 
                     (let [num-spaces-on-next-line (num-spaces-after-newline m)
-                          all-next-slurped (loop [i (inc @idx)]
-                                             (if (>= i num-nodes)
+                          all-next-slurped (loop [j (inc i)]
+                                             (if (>= j num-nodes)
                                                true
-                                               (let [nd-m @(nth nodes i)]
-                                                 (cond
-                                                   (ns-parser/is-newline-node nd-m) true
-                                                   (not (string? (:text nd-m))) (recur (inc i))
-                                                   (or (:_wasSlurpedUp nd-m) (ns-parser/is-whitespace-node nd-m)) (recur (inc i))
-                                                   :else false))))
-                          next-only-comment (let [n1 (when (< (inc @idx) num-nodes) @(nth nodes (inc @idx)))
-                                                  n2 (when (< (+ @idx 2) num-nodes) @(nth nodes (+ @idx 2)))]
-                                              (cond
-                                                (and n1 n2) (and (ns-parser/is-comment-node n1) (ns-parser/is-newline-node n2))
-                                                n1 (ns-parser/is-comment-node n1)
-                                                :else false))
+                                               (cond
+                                                 (kind? kinds j :newline) true
+                                                 (not (string? (:text (aget nodes j)))) (recur (inc j))
+                                                 (or (aget was-slurped-up j) (kind? kinds j :whitespace)) (recur (inc j))
+                                                 :else false)))
+                          next-only-comment (cond
+                                              (< (+ i 2) num-nodes) (and (kind? kinds (inc i) :comment) (kind? kinds (+ i 2) :newline))
+                                              (< (inc i) num-nodes) (kind? kinds (inc i) :comment)
+                                              :else false)
                           next-comment-col (if next-only-comment num-spaces-on-next-line -1)
-                          is-double-newline (str/includes? (:text m) "\n\n")
-                          newline-str (atom (if is-double-newline "\n\n" "\n"))]
+                          is-double-newline (str/includes? (:text m) "\n\n")]
 
                       (when @output-txt-contains-chars
                         (let [top (peek @paren-stack)]
                           ;; Rule 3 check
-                          (when (and top (not (:_rule3SearchComplete @top)))
-                            (let [opening-nodes (:_openingLineNodes @top)
-                                  num-op (count opening-nodes)]
+                          (when (and top (not (aget rule3-search-complete top)))
+                            (let [op-nodes (aget opening-line-nodes top)
+                                  num-op (count op-nodes)]
                               (when (> num-op 2)
-                                (loop [i 1
+                                (loop [k 1
                                        past-first-ws false]
-                                  (when (< i num-op)
-                                    (let [op-node (nth opening-nodes i)
-                                          op-m @op-node]
+                                  (when (< k num-op)
+                                    (let [op-idx (nth op-nodes k)]
                                       (cond
-                                        (and past-first-ws (ns-parser/is-node-with-non-blank-text op-m)
-                                             (= (:_origColIdx op-m) num-spaces-on-next-line))
-                                        (swap! top assoc :_rule3Active true
-                                                         :_rule3NumSpaces (or (:_printedColIdx op-m) 0))
+                                        (and past-first-ws (kind? kinds op-idx :non-blank-text)
+                                             (= (aget orig-col-idx op-idx) num-spaces-on-next-line))
+                                        (do
+                                          (aset rule3-active top true)
+                                          (aset rule3-num-spaces top (aget printed-col-idx op-idx)))
 
-                                        (and (not past-first-ws) (ns-parser/is-whitespace-node op-m))
-                                        (recur (inc i) true)
+                                        (and (not past-first-ws) (kind? kinds op-idx :whitespace))
+                                        (recur (inc k) true)
 
                                         :else
-                                        (recur (inc i) past-first-ws))))))
-                              (swap! top assoc :_rule3SearchComplete true)))
+                                        (recur (inc k) past-first-ws))))))
+                              (aset rule3-search-complete top true)))
 
                           ;; Comment vertical alignment check
-                          (let [col-idx-comment-align (atom -1)
-                                comment-aligned (atom false)]
-                            (when (and next-only-comment (not is-double-newline))
-                              (let [printed-nodes @nodes-we-have-printed-on-this-line
-                                    num-prev (count printed-nodes)]
-                                (loop [i 0]
-                                  (when (< i num-prev)
-                                    (let [prev-node (nth printed-nodes i)
-                                          prev-prev (when (> i 0) (nth printed-nodes (dec i)))
-                                          prev-m @prev-node
-                                          prev-prev-m (when prev-prev @prev-prev)
-                                          possible (and (ns-parser/is-node-with-non-blank-text prev-m)
-                                                        (or (nil? prev-prev-m) (not (ns-parser/is-paren-opener prev-prev-m))))]
-                                      (if (and possible (= next-comment-col (:_origColIdx prev-m)))
-                                        (do
-                                          (reset! col-idx-comment-align (:_printedColIdx prev-m))
-                                          (reset! comment-aligned true))
-                                        (recur (inc i))))))))
+                          (let [col-idx-comment-align
+                                (when (and next-only-comment (not is-double-newline))
+                                  (let [printed-nodes @nodes-we-have-printed-on-this-line
+                                        num-prev (count printed-nodes)]
+                                    (loop [k 0]
+                                      (when (< k num-prev)
+                                        (let [prev-idx (nth printed-nodes k)
+                                              possible (and (kind? kinds prev-idx :non-blank-text)
+                                                            (or (= k 0)
+                                                                (not (kind? kinds (nth printed-nodes (dec k)) :paren-opener))))]
+                                          (if (and possible (= next-comment-col (aget orig-col-idx prev-idx)))
+                                            (aget printed-col-idx prev-idx)
+                                            (recur (inc k))))))))
 
-                            (let [num-spaces
-                                  (cond
-                                    (and top (:_rule3Active @top))
-                                    (:_rule3NumSpaces @top)
+                                num-spaces
+                                (cond
+                                  (and top (aget rule3-active top))
+                                  (aget rule3-num-spaces top)
 
-                                    (and next-only-comment @comment-aligned)
-                                    @col-idx-comment-align
+                                  (and next-only-comment col-idx-comment-align)
+                                  col-idx-comment-align
 
-                                    (and next-only-comment (not top))
-                                    num-spaces-on-next-line
+                                  (and next-only-comment (not top))
+                                  num-spaces-on-next-line
 
-                                    :else
-                                    (if-not top
-                                      0
-                                      (let [opener @top
-                                            next-node (:_nextWithTextSkippingMeta opener)
-                                            opener-col (or (:_printedColIdx opener) 0)]
+                                  :else
+                                  (if-not top
+                                    0
+                                    (let [opener (node-at top)
+                                          next-node (next-text-skipping-meta top)
+                                          opener-col (aget printed-col-idx top)]
+                                      (cond
+                                        (ns-parser/is-reader-conditional-opener opener)
+                                        (+ opener-col (count (:text opener)))
+
+                                        (and next-node (ns-parser/is-paren-opener next-node))
                                         (cond
-                                          (ns-parser/is-reader-conditional-opener opener)
-                                          (+ opener-col (count (:text opener)))
-
-                                          (and next-node (ns-parser/is-paren-opener next-node))
-                                          (cond
-                                            (ns-parser/is-map-literal-opener opener) (inc opener-col)
-                                            (ns-parser/is-vector-literal-opener opener) (inc opener-col)
-                                            (ns-parser/is-single-paren-opener opener) (inc opener-col)
-                                            (ns-parser/is-set-literal-opener opener) (+ opener-col 2)
-                                            (ns-parser/is-anon-fn-opener opener) (+ opener-col 2)
-                                            :else (throw (Exception. "Error inside numSpacesForIndentation")))
-
                                           (ns-parser/is-map-literal-opener opener) (inc opener-col)
                                           (ns-parser/is-vector-literal-opener opener) (inc opener-col)
-                                          (ns-parser/is-anon-fn-opener opener) (+ opener-col 3)
-                                          (ns-parser/is-namespaced-map-opener opener) (+ opener-col (count (:text opener)))
-                                          :else (+ opener-col 2)))))]
+                                          (ns-parser/is-single-paren-opener opener) (inc opener-col)
+                                          (ns-parser/is-set-literal-opener opener) (+ opener-col 2)
+                                          (ns-parser/is-anon-fn-opener opener) (+ opener-col 2)
+                                          :else (throw (Exception. "Error inside numSpacesForIndentation")))
 
-                              (let [indent-str (atom (repeat-string " " num-spaces))]
-                                (when all-next-slurped
-                                  (reset! newline-str "")
-                                  (reset! indent-str ""))
+                                        (ns-parser/is-map-literal-opener opener) (inc opener-col)
+                                        (ns-parser/is-vector-literal-opener opener) (inc opener-col)
+                                        (ns-parser/is-anon-fn-opener opener) (+ opener-col 3)
+                                        (ns-parser/is-namespaced-map-opener opener) (+ opener-col (count (:text opener)))
+                                        :else (+ opener-col 2)))))
 
-                                (when (ns-parser/is-comma-node m)
-                                  (let [trail (str/trimr (remove-leading-whitespace (:text m)))]
-                                    (swap! indent-str str trail)))
+                                indent-str (cond-> (if all-next-slurped "" (repeat-string " " num-spaces))
+                                             (kind? kinds i :comma)
+                                             (str (str/trimr (remove-leading-whitespace (:text m)))))
+                                newline-str (cond
+                                              all-next-slurped ""
+                                              is-double-newline "\n\n"
+                                              :else "\n")]
 
-                                (when (str-has-non-whitespace-chars @line-txt)
-                                  (swap! out-txt str @line-txt))
-                                (swap! out-txt str @newline-str)
+                            (when (sb-has-non-whitespace-chars line-sb)
+                              (.append out-sb line-sb))
+                            (.append out-sb ^String newline-str)
 
-                                (reset! line-txt @indent-str)
-                                (reset! nodes-we-have-printed-on-this-line [])
-                                (reset! col-idx (count @indent-str))
-                                (swap! line-idx inc)
-                                (when is-double-newline
-                                  (swap! line-idx inc)))))))
+                            (.setLength line-sb 0)
+                            (.append line-sb ^String indent-str)
+                            (vreset! nodes-we-have-printed-on-this-line [])
+                            (vswap! line-idx inc)
+                            (when is-double-newline
+                              (vswap! line-idx inc)))))
 
-                      (reset! skip-printing-this-node true)))
+                      (vreset! skip-printing-this-node true)))
 
-                  (when (and (ns-parser/node-contains-text @node) (not @skip-printing-this-node))
-                    (let [next-txt-m (when next-text-node @next-text-node)
-                          is-tok-fol-by-op (and (ns-parser/is-token-node @node) next-txt-m (ns-parser/is-paren-opener next-txt-m))
-                          is-closer-fol-by-txt (and (ns-parser/is-paren-closer @node) next-txt-m
-                                                    (or (ns-parser/is-token-node next-txt-m)
-                                                        (ns-parser/is-paren-opener next-txt-m)))
-                          add-space (or is-tok-fol-by-op is-closer-fol-by-txt)
-                          node-txt (atom (:text @node))]
+                  (let [node-m (node-at i)]
+                    (when (and (kind? kinds i :text) (not @skip-printing-this-node))
+                      (let [is-tok-fol-by-op (and (kind? kinds i :token) next-text-idx (kind? kinds next-text-idx :paren-opener))
+                            is-closer-fol-by-txt (and (kind? kinds i :paren-closer) next-text-idx
+                                                      (or (kind? kinds next-text-idx :token)
+                                                          (kind? kinds next-text-idx :paren-opener)))
+                            add-space (or is-tok-fol-by-op is-closer-fol-by-txt)
+                            node-txt (if (kind? kinds i :comment)
+                                       (cond-> (:text node-m)
+                                         (ns-parser/comment-needs-space-inside (:text node-m))
+                                         (str/replace-first #"^(;+)([^ ])" "$1 $2")
 
-                      (when (ns-parser/is-comment-node @node)
-                        (when (ns-parser/comment-needs-space-inside @node-txt)
-                          (swap! node-txt str/replace-first #"^(;+)([^ ])" "$1 $2"))
-                        (when (ns-parser/comment-needs-space-before @line-txt @node-txt)
-                          (swap! node-txt #(str " " %))))
+                                         true
+                                         (as-> t (if (ns-parser/comment-needs-space-before (str line-sb) t)
+                                                   (str " " t)
+                                                   t)))
+                                       (:text node-m))]
 
-                      (cond
-                        (and current-node-is-whitespace (or is-last-node (not @output-txt-contains-chars)))
-                        (reset! skip-printing-this-node true)
+                        (cond
+                          (and current-node-is-whitespace (or is-last-node (not @output-txt-contains-chars)))
+                          (vreset! skip-printing-this-node true)
 
-                        (and (ns-parser/is-comment-node @node)
-                             (= (get parsed-ns "commentOutsideNsForm") (:text @node))
-                             (= @line-idx @line-idx-of-closing-ns-form))
-                        (reset! skip-printing-this-node true)
+                          (and (kind? kinds i :comment)
+                               (= (get parsed-ns "commentOutsideNsForm") (:text node-m))
+                               (= @line-idx @line-idx-of-closing-ns-form))
+                          (vreset! skip-printing-this-node true)
 
-                        (and current-node-is-whitespace (= @line-idx @line-idx-of-closing-ns-form))
-                        (reset! skip-printing-this-node true))
+                          (and current-node-is-whitespace (= @line-idx @line-idx-of-closing-ns-form))
+                          (vreset! skip-printing-this-node true))
 
-                      (when-not @skip-printing-this-node
-                        (let [line-len-before (count @line-txt)]
-                          (swap! line-txt str @node-txt)
-                          (when (not= @line-txt "")
-                            (reset! output-txt-contains-chars true))
+                        (when-not @skip-printing-this-node
+                          (let [line-len-before (.length line-sb)]
+                            (.append line-sb ^String node-txt)
+                            (when (pos? (.length line-sb))
+                              (vreset! output-txt-contains-chars true))
 
-                          (swap! node assoc :_printedColIdx line-len-before
-                                            :_printedLineIdx @line-idx)
-                          (swap! nodes-we-have-printed-on-this-line conj node)))
+                            (aset printed-col-idx i (long line-len-before))
+                            (vswap! nodes-we-have-printed-on-this-line conj i)))
 
-                      (when add-space
-                        (swap! line-txt str " "))
+                        (when add-space
+                          (.append line-sb " ")))))))))
 
-                      (swap! col-idx + (count @node-txt)))))))
+          (vswap! idx inc)))
 
-            (swap! idx inc))))
-
-      (when (not= @line-txt "")
-        (swap! out-txt str @line-txt))
+      (when (pos? (.length line-sb))
+        (.append out-sb line-sb))
 
       ;; Replace ns form with formatted version
-      (when (> @ns-start-string-idx 0)
-        (let [head-str (subs @out-txt 0 (dec @ns-start-string-idx))
-              ns-str (try
-                       (format-ns parsed-ns)
-                       (catch Exception e
-                         (throw e)))
-              tail-str (if (> @ns-end-string-idx 0)
-                         (subs @out-txt (inc @ns-end-string-idx))
-                         "")]
-          (reset! out-txt (str head-str ns-str tail-str))))
-
-      {:status "success"
-       :out (str/trim @out-txt)})))
+      (let [out-txt (str out-sb)
+            out-txt (if (> @ns-start-string-idx 0)
+                      (str (subs out-txt 0 (dec @ns-start-string-idx))
+                           (format-ns parsed-ns)
+                           (if (> @ns-end-string-idx 0)
+                             (subs out-txt (inc @ns-end-string-idx))
+                             ""))
+                      out-txt)]
+        {:status "success"
+         :out (str/trim out-txt)}))))
 
 (defn format-text [^String input-txt]
   (let [cleaned-txt (crlf-to-lf input-txt)

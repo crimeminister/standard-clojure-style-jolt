@@ -2,3 +2,6 @@
 *.build/
 standard-clj
 target/
+.clj-kondo/
+.cpcache/
+.lsp/
